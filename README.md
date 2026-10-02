@@ -8,3 +8,6 @@ Daily server status report to Telegram.
 - `--dry` prints the report instead of sending it.
 
 Deploy: cron on horek_ge, `0 5 * * *`.
+
+On demand: send `/servers` to the Telegram bot (handler added to `vpn_bot.py` by `deploy/vpn_bot_servers_cmd.py`).
+Apply all server-side patches with `deploy/apply_on_horek_ge.sh`.
