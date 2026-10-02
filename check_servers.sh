@@ -44,6 +44,7 @@ done < "$DIR/servers.conf"
 wait
 
 body=$(cat "$TMP"/* 2>/dev/null)
+ok=$(grep -c '^✅' <<<"$body"); bad=$(grep -c '^❌' <<<"$body")
 if [ -f "$DIR/ollama.conf" ]; then
   ol=""
   while read -r ep; do
@@ -63,7 +64,6 @@ PY2
   done < "$DIR/ollama.conf"
   body="$body"$'\n'"🧠 <b>Ollama API</b>"$'\n'"$ol"
 fi
-ok=$(grep -c '^✅' <<<"$body"); bad=$(grep -c '^❌' <<<"$body")
 msg="🖥 <b>Server status</b> $(date '+%Y-%m-%d %H:%M')  —  ${ok} up, ${bad} down"$'\n\n'"$body"
 
 if [ "$DRY" = 1 ]; then echo "$msg"; exit 0; fi
