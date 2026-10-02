@@ -3,8 +3,9 @@
 set -u
 DIR="$(cd "$(dirname "$0")" && pwd)"
 export PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-export HOME="${HOME:-/Users/aleksandr.koviazin}"
+export HOME="${HOME:-$(eval echo ~$(id -un))}"
 . "$DIR/.env"
+KEYOPT=(); [ -n "${SSH_KEY:-}" ] && KEYOPT=(-i "$SSH_KEY")
 DRY=0; [ "${1:-}" = "--dry" ] && DRY=1
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 
@@ -12,7 +13,7 @@ REMOTE='printf "HOST=%s|UP=%s|LOAD=%s|CPUS=%s|MEM=%s|DISK=%s|DOCKER=%s\n" "$(hos
 
 probe() {  # name target port
   local name="$1" target="$2" port="$3" out
-  out=$(ssh -tt -p "$port" -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
+  out=$(ssh -tt "${KEYOPT[@]}" -p "$port" -o IPQoS=none -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
         -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR "$target" "$REMOTE" 2>&1 | tr -d '\r')
   local line; line=$(echo "$out" | grep -m1 '^HOST=')
   if [ -n "$line" ]; then
