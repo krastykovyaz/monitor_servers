@@ -13,7 +13,7 @@ REMOTE='printf "HOST=%s|UP=%s|LOAD=%s|CPUS=%s|MEM=%s|DISK=%s|DOCKER=%s\n" "$(hos
 
 probe() {  # name target port
   local name="$1" target="$2" port="$3" out
-  out=$(ssh -tt "${KEYOPT[@]}" -p "$port" -o IPQoS=none -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
+  out=$(ssh -tt ${KEYOPT[@]+"${KEYOPT[@]}"} -p "$port" -o IPQoS=none -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
         -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR "$target" "$REMOTE" 2>&1 | tr -d '\r')
   local line; line=$(echo "$out" | grep -m1 '^HOST=')
   if [ -n "$line" ]; then
