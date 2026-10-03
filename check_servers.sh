@@ -13,7 +13,7 @@ REMOTE='printf "HOST=%s|UP=%s|LOAD=%s|CPUS=%s|MEM=%s|DISK=%s|DOCKER=%s\n" "$(hos
 
 probe() {  # name target port
   local name="$1" target="$2" port="$3" out
-  out=$(ssh -tt ${KEYOPT[@]+"${KEYOPT[@]}"} -p "$port" -o IPQoS=none -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
+  out=$(ssh ${KEYOPT[@]+"${KEYOPT[@]}"} -p "$port" -o IPQoS=none -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
         -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR "$target" "$REMOTE" 2>&1 | tr -d '\r')
   local line; line=$(echo "$out" | grep -m1 '^HOST=')
   if [ -n "$line" ]; then
@@ -31,7 +31,7 @@ probe() {  # name target port
     printf '✅ <b>%s</b>%s\n   up %s · load %s/%s cpu · ram %s · disk %s · docker %s\n' \
       "$name" "$warn" "$up" "$l1" "$cpus" "$mem" "$disk" "$dock"
   else
-    local err; err=$(echo "$out" | grep -v '^$' | tail -1 | sed 's/^ssh: //; s/.*Permission denied.*/Permission denied (key not accepted)/; s/.*timed out.*/timed out/; s/.*Could not resolve.*/DNS failed/; s/.*Broken pipe.*/session dropped/')
+    local err; err=$(echo "$out" | grep -v '^$' | tail -1 | sed 's/^ssh: //; s/.*Permission denied.*/Permission denied (key not accepted)/; s/.*timed out.*/timed out/; s/.*Could not resolve.*/DNS failed/; s/.*Broken pipe.*/session dropped/' | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g' | cut -c1-120)
     printf '❌ <b>%s</b> — %s\n' "$name" "${err:-no response}"
   fi
 }
@@ -87,19 +87,15 @@ msg="🖥 <b>Server status</b> $(date '+%Y-%m-%d %H:%M')  —  ${ok} up, ${bad} 
 
 if [ "$DRY" = 1 ]; then echo "$msg"; exit 0; fi
 
-# Auto-register chat id on first run: the first chat that messaged the bot
-if [ -z "${TG_CHAT_ID:-}" ]; then
-  TG_CHAT_ID=$(curl -s -m 15 "https://api.telegram.org/bot$TG_BOT_TOKEN/getUpdates" | python3 -c 'import sys,json
-for u in json.load(sys.stdin).get("result",[]):
-    m=u.get("message") or u.get("channel_post")
-    if m: print(m["chat"]["id"]); break')
-  if [ -z "$TG_CHAT_ID" ]; then echo "$(date) no chat id: send /start to the bot first" >&2; echo "$msg"; exit 2; fi
-  sed -i '' "s/^TG_CHAT_ID=.*/TG_CHAT_ID=$TG_CHAT_ID/" "$DIR/.env"
+if [ -z "${TG_BOT_TOKEN:-}" ] || [ -z "${TG_CHAT_ID:-}" ]; then
+  echo "$(date) TG_BOT_TOKEN and TG_CHAT_ID must be set in $DIR/.env" >&2; exit 2
 fi
 
-python3 - "$TG_BOT_TOKEN" "$TG_CHAT_ID" "$msg" <<'PY'
-import sys, json, urllib.request, urllib.parse
-tok, chat, msg = sys.argv[1], sys.argv[2], sys.argv[3]
+# The token travels in the environment, not on the command line where `ps` would show it.
+export TG_BOT_TOKEN TG_CHAT_ID
+python3 - "$msg" <<'PY' || exit 1
+import os, sys, json, urllib.request, urllib.parse
+tok, chat, msg = os.environ["TG_BOT_TOKEN"], os.environ["TG_CHAT_ID"], sys.argv[1]
 chunks, cur = [], ""
 for line in msg.split("\n"):
     if len(cur) + len(line) + 1 > 3900: chunks.append(cur); cur = ""
@@ -110,3 +106,6 @@ for c in chunks:
     r = json.load(urllib.request.urlopen(f"https://api.telegram.org/bot{tok}/sendMessage", data, timeout=20))
     print("sent" if r.get("ok") else f"telegram error: {r}")
 PY
+
+# Heartbeat: this job runs once a day, so its own silence limit is 26 hours.
+[ -n "${HB_URL:-}" ] && curl -s -m 10 -o /dev/null "${HB_URL%/}/daily-status?max=93600" || true

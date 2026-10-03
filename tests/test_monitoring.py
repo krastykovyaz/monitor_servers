@@ -19,6 +19,8 @@ from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+import common  # noqa: E402
 
 
 def load(name, filename):
@@ -144,7 +146,7 @@ class MainLoop(unittest.TestCase):
              mock.patch.object(sys, "argv", ["watch.py"]), mock.patch("builtins.print"):
             try:
                 watch.main()
-            except OSError:
+            except (OSError, SystemExit):
                 pass
         return sent, beats
 
@@ -191,10 +193,36 @@ class TelegramChunking(unittest.TestCase):
             chunks.append(parse_qs(data.decode())["text"][0])
             return Resp()
 
-        with mock.patch.object(watch.urllib.request, "urlopen", fake_urlopen):
+        with mock.patch.object(common.urllib.request, "urlopen", fake_urlopen):
             watch.send({"TG_CHAT_ID": "1", "TG_BOT_TOKEN": "x"}, text)
         broken = [i for i, c in enumerate(chunks) if c.count("<pre>") != c.count("</pre>")]
         self.assertEqual(broken, [], "chunks %s split a <pre> block" % broken)
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(len(c) <= 4096 for c in chunks), "a chunk exceeds Telegram's limit")
+        strip = lambda t: t.replace("<pre>", "").replace("</pre>", "").replace("\n", "")
+        self.assertEqual(strip("".join(chunks)), strip(text), "content was lost or duplicated by chunking")
+
+    def test_rejected_markup_falls_back_to_plain_text(self):
+        """If Telegram rejects the HTML (HTTP 400), the message is resent as plain text instead of being lost."""
+        import urllib.error
+        calls = []
+
+        class Resp:
+            def read(self):
+                return b"{}"
+
+        def fake_urlopen(url, data, timeout):
+            from urllib.parse import parse_qs
+            f = parse_qs(data.decode())
+            calls.append(f)
+            if "parse_mode" in f:
+                raise urllib.error.HTTPError(url, 400, "Bad Request", None, None)
+            return Resp()
+
+        with mock.patch.object(common.urllib.request, "urlopen", fake_urlopen):
+            common.tg_send({"TG_CHAT_ID": "1", "TG_BOT_TOKEN": "x"}, "<b>host</b> a &lt; b")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1]["text"][0].strip(), "host a < b")
 
 
 class Prober(unittest.TestCase):
@@ -239,13 +267,16 @@ class Prober(unittest.TestCase):
         src = (ROOT / "probe.py").read_text()
         self.assertLess(src.index("send(env, msg)"), src.index("os.replace(str(tmp), str(STATE_FILE))"),
                         "probe.py saves state before sending, so a failed send loses the alert")
+        self.assertLess(src.index("os.replace(str(tmp), str(STATE_FILE))"), src.index("hb_ping(env"),
+                        "probe.py must send its heartbeat only after a fully successful run")
 
 
 class HeartbeatReceiver(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
-        env = {"HB_SECRET": "s3cret", "TG_BOT_TOKEN": "x", "TG_CHAT_ID": "1", "STATE_DIRECTORY": cls.tmp.name}
+        env = {"HB_SECRET": "s3cret", "HB_ADMIN_SECRET": "adm1n", "TG_BOT_TOKEN": "x", "TG_CHAT_ID": "1",
+               "STATE_DIRECTORY": cls.tmp.name}
         with mock.patch.dict(os.environ, env):
             cls.hb = load("heartbeat_server", "heartbeat_server.py")
         cls.srv = cls.hb.ThreadingHTTPServer(("127.0.0.1", 0), cls.hb.Handler)
@@ -270,6 +301,34 @@ class HeartbeatReceiver(unittest.TestCase):
         self.assertEqual(self.get("/hb/wrong/host-a"), 404)
         self.assertEqual(self.get("/hb/s3cret/a%20b"), 404)
         self.assertEqual(self.get("/status/wrong"), 404)
+
+    def test_forget_needs_the_admin_secret(self):
+        """The secret every host knows must not be able to remove hosts from watch."""
+        self.assertEqual(self.get("/hb/s3cret/doomed"), 200)
+        self.assertEqual(self.get("/forget/s3cret/doomed"), 404)
+        self.assertIn("doomed", self.hb.beats)
+        self.assertEqual(self.get("/forget/adm1n/doomed"), 200)
+        self.assertNotIn("doomed", self.hb.beats)
+
+    def test_per_name_silence_limit(self):
+        """A daily job announces its own limit (?max=) and is not reported silent after 25 minutes."""
+        self.assertEqual(self.get("/hb/s3cret/daily-job?max=93600"), 200)
+        with self.hb.lock:
+            self.hb.beats["daily-job"]["last"] = time.time() - 7200
+        sent, calls = [], {"n": 0}
+
+        def one_tick(_):
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise StopIteration
+
+        with mock.patch.object(self.hb, "tg", sent.append), mock.patch.object(self.hb.time, "sleep", one_tick):
+            try:
+                self.hb.checker()
+            except StopIteration:
+                pass
+        self.assertFalse(self.hb.beats["daily-job"]["silent"])
+        self.assertFalse(any("daily-job" in m and "silent" in m for m in sent))
 
     def test_silence_is_detected(self):
         with self.hb.lock:

@@ -18,23 +18,14 @@ import urllib.parse, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from common import dur, hb_ping, load_kv, tg_send
+
 DIR = Path(__file__).resolve().parent
 STATE_FILE = DIR / "state" / "probe_state.json"
 TIMEOUT = 15
 CONFIRM = 2            # consecutive failures before alerting
 CERT_WARN_DAYS = 14
 CERT_REPEAT_H = 72
-
-
-def load_kv(path):
-    d = {}
-    if path.exists():
-        for line in path.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                d[k.strip()] = v.strip().strip('"').strip("'")
-    return d
 
 
 def load_probes():
@@ -112,22 +103,8 @@ def check(p):
     return r
 
 
-def dur(sec):
-    sec = int(sec)
-    return "%d min" % max(1, sec // 60) if sec < 3600 else ("%.0f h" % (sec / 3600) if sec < 172800 else "%.0f d" % (sec / 86400))
-
-
 def send(env, text):
-    chunks, cur = [], ""
-    for line in text.split("\n"):
-        if len(cur) + len(line) + 1 > 3900:
-            chunks.append(cur); cur = ""
-        cur += line + "\n"
-    chunks.append(cur)
-    for ch in chunks:
-        data = urllib.parse.urlencode({"chat_id": env["TG_CHAT_ID"], "text": ch, "parse_mode": "HTML",
-                                       "disable_web_page_preview": "1"}).encode()
-        urllib.request.urlopen("https://api.telegram.org/bot%s/sendMessage" % env["TG_BOT_TOKEN"], data, timeout=20).read()
+    tg_send(env, text)
 
 
 def main():
@@ -149,6 +126,10 @@ def main():
             skipped.append(p["name"])
             continue
         probes.append(p)
+    # forget targets that were removed from probes.conf
+    names = {p["name"] for p in load_probes()}
+    for gone in [n for n in checks if n not in names]:
+        checks.pop(gone)
     with ThreadPoolExecutor(max_workers=16) as ex:
         results = list(zip(probes, ex.map(check, probes)))
 
@@ -213,12 +194,18 @@ def main():
         print("\n[dry run: %d checked, %d failing, %d skipped as this machine's own]" % (
             len(results), sum(1 for p, r in results if not r["ok"]), len(skipped)))
         return
+    if msg:      # deliver first: a failed send must not mark the alert as delivered
+        try:
+            send(env, msg)
+        except Exception as e:
+            print("%s alert NOT delivered (%s: %s); state not saved, will retry next run" % (
+                time.strftime("%F %T"), type(e).__name__, e))
+            sys.exit(1)
     STATE_FILE.parent.mkdir(exist_ok=True)
     tmp = STATE_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(state))
     os.replace(str(tmp), str(STATE_FILE))
-    if msg:
-        send(env, msg)
+    hb_ping(env, env.get("HB_NAME", socket.gethostname().split(".")[0]) + "-probe")
     print("%s checked=%d failing=%d fired=%d resolved=%d" % (time.strftime("%F %T"), len(results),
           sum(1 for p, r in results if not r["ok"]), len(fired), len(resolved)))
 

@@ -15,6 +15,8 @@ import urllib.parse, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from common import dur, hb_ping, load_kv, tg_send
+
 DIR = Path(__file__).resolve().parent
 STATE_FILE = DIR / "state" / "watch_state.json"
 
@@ -114,18 +116,6 @@ except Exception:
 fi
 echo "END"
 '''
-
-
-def load_kv(path):
-    d = {}
-    if path.exists():
-        for line in path.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            d[k.strip()] = v.strip().strip('"').strip("'")
-    return d
 
 
 def load_cfg():
@@ -234,7 +224,7 @@ def collect(server, env, with_du, expect=None):
         cmd = ["env", "DU=%d" % (1 if with_du else 0), "bash", "-s"]
     try:
         r = subprocess.run(cmd, input=script, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           universal_newlines=True, timeout=300 if with_du else 90)
+                           universal_newlines=True, timeout=900 if with_du else 90)
         return name, parse(r.stdout)
     except Exception:
         return name, None
@@ -242,15 +232,6 @@ def collect(server, env, with_du, expect=None):
 
 def mb(b):
     return "-" if b is None else "%d MB" % round(b / 1048576)
-
-
-def dur(sec):
-    sec = int(sec)
-    if sec < 3600:
-        return "%d min" % max(1, sec // 60)
-    if sec < 172800:
-        return "%.0f h" % (sec / 3600)
-    return "%.0f d" % (sec / 86400)
 
 
 class Watch:
@@ -297,9 +278,10 @@ class Watch:
                         a["text"].split(" — ")[0], (" — now " + ok) if ok else "", dur(self.now - a["since"])))
 
     def drop(self, prefix, keep):
-        """Forget alerts for items that no longer exist (removed service or container)."""
-        for key in [k for k in self.s["active"] if k.startswith(prefix) and k[len(prefix):].split(":")[0] not in keep]:
-            self.s["active"].pop(key, None)
+        """Forget alerts, counters and history of items that no longer exist (removed service, container, ...)."""
+        for bucket in ("active", "pending", "cooldown", "hist"):
+            for key in [k for k in self.s[bucket] if k.startswith(prefix) and k[len(prefix):].split(":")[0].split("#")[0] not in keep]:
+                self.s[bucket].pop(key, None)
 
     def event(self, key, text, baseline=False, cooldown_h=None):
         """Counter-type alert: repeats at most once per cooldown."""
@@ -375,7 +357,8 @@ class Watch:
             free_gb = (h["disk_total_kb"] - h["disk_used_kb"]) / 1048576.0
             txt = "%s disk — %d%% used, %.1f GB free" % (B, round(pct), free_gb)
             self.cond("%s:disk:warn" % name, pct >= c["DISK_WARN_PCT"], txt, baseline=baseline, clear=pct < c["DISK_WARN_PCT"] - 2, ok="%d%%" % round(pct))
-            self.cond("%s:disk:crit" % name, pct >= c["DISK_CRIT_PCT"], "🔥 " + txt, baseline=baseline, ok="%d%%" % round(pct))
+            self.cond("%s:disk:crit" % name, pct >= c["DISK_CRIT_PCT"], "🔥 " + txt, baseline=baseline,
+                      clear=pct < c["DISK_CRIT_PCT"] - 2, ok="%d%%" % round(pct))
             old = self.hist_old("%s:disk" % name, 20)
             self.hist_add("%s:disk" % name, h["disk_used_kb"])
             if old is not None and (h["disk_used_kb"] - old) / 1048576.0 > c["DISK_GROW_GB_24H"]:
@@ -393,7 +376,8 @@ class Watch:
                       confirm=2, baseline=baseline, clear=sp < c["SWAP_USED_PCT"] - 15, ok="%d%% used" % round(sp))
         if h.get("cpus") and h.get("load1") is not None:
             self.cond("%s:load" % name, h["load1"] > h["cpus"] * c["LOAD_FACTOR"],
-                      "%s load — %.2f on %d cpu" % (B, h["load1"], h["cpus"]), confirm=3, baseline=baseline, ok="%.2f" % h["load1"])
+                      "%s load — %.2f on %d cpu" % (B, h["load1"], h["cpus"]), confirm=3, baseline=baseline,
+                      clear=h["load1"] < h["cpus"] * c["LOAD_FACTOR"] * 0.75, ok="%.2f" % h["load1"], unconfirm=2)
 
         # services
         pserv = prev.get("services", {})
@@ -467,6 +451,8 @@ class Watch:
         for port in exp.get("port", []):
             self.cond("%s:eport:%s" % (name, port), port not in d["allports"], "%s · port %s — nothing is listening" % (B, port),
                       confirm=2, baseline=baseline, ok="listening")
+        self.drop("%s:proc:" % name, set(exp.get("proc", [])))
+        self.drop("%s:eport:" % name, set(exp.get("port", [])))
 
         # PM2 apps
         ppm = prev.get("pm2", {})
@@ -635,10 +621,7 @@ def digest(results, state, now, only=None):
 
 
 def heartbeat(env, servers):
-    """Tell the heartbeat receiver this watcher is alive (HB_URL in .env). Silence there raises an alert."""
-    url = env.get("HB_URL")
-    if not url:
-        return
+    """Tell the heartbeat receiver this watcher is alive. Silence there raises an alert."""
     if env.get("HB_NAME"):
         name = env["HB_NAME"]
     elif len(servers) == 1 and servers[0][1] == "local":
@@ -646,24 +629,11 @@ def heartbeat(env, servers):
     else:
         import socket
         name = socket.gethostname().split(".")[0] + "-central"
-    try:
-        urllib.request.urlopen(url.rstrip("/") + "/" + urllib.parse.quote(name), timeout=10).read()
-    except Exception:
-        pass
+    hb_ping(env, name)
 
 
 def send(env, text):
-    chunks, cur = [], ""
-    for line in text.split("\n"):
-        if len(cur) + len(line) + 1 > 3900:
-            chunks.append(cur)
-            cur = ""
-        cur += line + "\n"
-    chunks.append(cur)
-    for ch in chunks:
-        data = urllib.parse.urlencode({"chat_id": env["TG_CHAT_ID"], "text": ch, "parse_mode": "HTML",
-                                       "disable_web_page_preview": "1"}).encode()
-        urllib.request.urlopen("https://api.telegram.org/bot%s/sendMessage" % env["TG_BOT_TOKEN"], data, timeout=20).read()
+    tg_send(env, text)
 
 
 def main():
@@ -675,8 +645,15 @@ def main():
     first_run = not state.get("seen")
     with_du = do_show or (not do_digest and now - state.get("last_du", 0) > 20 * 3600)
     servers, expect = load_servers(include=only), load_expect()
+    if not servers:
+        print("%s no servers to watch in servers.conf" % time.strftime("%F %T"))
+        return
     with ThreadPoolExecutor(max_workers=len(servers)) as ex:
         results = list(ex.map(lambda s: collect(s, env, with_du, expect), servers))
+        if with_du:      # a slow folder scan must not make a host look unreachable
+            retry = [s for s, (n, d) in zip(servers, results) if d is None]
+            again = dict(ex.map(lambda s: collect(s, env, False, expect), retry))
+            results = [(n, d if d is not None else again.get(n)) for n, d in results]
     if do_show:
         show(results, only)
         return
@@ -698,7 +675,7 @@ def main():
             w.unreachable(name)
         else:
             never.append(name)
-    if with_du:
+    if with_du and any(d and d["du"] for n, d in results):
         state["last_du"] = now
 
     parts = []
@@ -720,13 +697,20 @@ def main():
         print(msg or "(nothing to send)")
         print("\n[dry run: %d reachable, %d active conditions, state not saved]" % (sum(1 for n, d in results if d), len(state["active"])))
         return
+    # Deliver first. If Telegram cannot be reached, nothing is saved and no heartbeat goes out: the next
+    # run evaluates the same conditions again, and the missing heartbeat makes the failure visible.
+    if msg:
+        try:
+            send(env, msg)
+        except Exception as e:
+            print("%s alert NOT delivered (%s: %s); state not saved, will retry next run" % (
+                time.strftime("%F %T"), type(e).__name__, e))
+            sys.exit(1)
     STATE_FILE.parent.mkdir(exist_ok=True)
     tmp = STATE_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(state))
     os.replace(str(tmp), str(STATE_FILE))
     heartbeat(env, servers)
-    if msg:
-        send(env, msg)
     print("%s reachable=%d fired=%d resolved=%d active=%d" % (
         time.strftime("%F %T"), sum(1 for n, d in results if d), len(w.fired), len(w.resolved), len(state["active"])))
 
