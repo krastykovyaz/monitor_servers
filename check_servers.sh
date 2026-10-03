@@ -37,15 +37,33 @@ probe() {  # name target port
 }
 
 i=0
-while IFS='|' read -r name target port; do
-  name=$(echo "$name" | xargs); target=$(echo "$target" | xargs); port=$(echo "${port:-22}" | xargs)
+# Heartbeat ages for hosts that watch themselves (flag "self" in servers.conf)
+HBS=""; [ -n "${HB_URL:-}" ] && HBS=$(curl -s -m 8 "$(echo "$HB_URL" | sed 's#/hb/#/status/#')" 2>/dev/null)
+beat() {  # name
+  python3 - "$1" "$HBS" <<'PYB'
+import sys, json
+name, raw = sys.argv[1], sys.argv[2]
+try: v = json.loads(raw).get(name)
+except Exception: v = None
+if v is None:
+    print("❔ <b>%s</b> — watches itself, no heartbeat on record" % name)
+elif v["silent"]:
+    print("❌ <b>%s</b> — silent, last heartbeat %d min ago" % (name, v["age_s"] // 60))
+else:
+    print("💓 <b>%s</b> — watches itself, last heartbeat %d min ago" % (name, v["age_s"] // 60))
+PYB
+}
+while IFS='|' read -r name target port flags; do
+  name=$(echo "$name" | xargs); target=$(echo "$target" | xargs); port=$(echo "${port:-22}" | xargs); flags=$(echo "${flags:-}" | xargs)
   [ -z "$name" ] || [ "${name#\#}" != "$name" ] && continue
-  i=$((i+1)); probe "$name" "$target" "$port" > "$TMP/$(printf '%02d' $i)" &
+  i=$((i+1))
+  if [ "$flags" = "self" ]; then beat "$name" > "$TMP/$(printf '%02d' $i)"; continue; fi
+  probe "$name" "$target" "$port" > "$TMP/$(printf '%02d' $i)" &
 done < "$DIR/servers.conf"
 wait
 
 body=$(cat "$TMP"/* 2>/dev/null)
-ok=$(grep -c '^✅' <<<"$body"); bad=$(grep -c '^❌' <<<"$body")
+ok=$(grep -cE '^(✅|💓)' <<<"$body"); bad=$(grep -cE '^(❌|❔)' <<<"$body")
 if [ -f "$DIR/ollama.conf" ]; then
   ol=""
   while read -r ep; do

@@ -150,14 +150,18 @@ def load_expect():
     return exp
 
 
-def load_servers():
+def load_servers(include=None):
+    """Hosts flagged "self" watch themselves and are skipped here, unless named explicitly."""
     out = []
     for line in (DIR / "servers.conf").read_text().splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         p = [x.strip() for x in line.split("|")]
-        out.append((p[0], p[1], p[2] if len(p) > 2 and p[2] else "22"))
+        flags = p[3].split(",") if len(p) > 3 else []
+        if "self" in flags and p[1] != "local" and p[0] != include:
+            continue
+        out.append((p[0], p[1], p[2] if len(p) > 2 and p[2] and p[2] != "-" else "22"))
     return out
 
 
@@ -670,7 +674,7 @@ def main():
     state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
     first_run = not state.get("seen")
     with_du = do_show or (not do_digest and now - state.get("last_du", 0) > 20 * 3600)
-    servers, expect = load_servers(), load_expect()
+    servers, expect = load_servers(include=only), load_expect()
     with ThreadPoolExecutor(max_workers=len(servers)) as ex:
         results = list(ex.map(lambda s: collect(s, env, with_du, expect), servers))
     if do_show:
