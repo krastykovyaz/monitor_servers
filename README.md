@@ -61,7 +61,7 @@ prober on another server covers them: horek_ge probes everything else, horek_fi 
 
 ## Heartbeats (`heartbeat_server.py`)
 
-A small receiver on horek_ge (systemd unit `monitor-heartbeat`, port 8787). Every watcher calls it after each
+A small receiver on horek_ge (systemd unit `monitor-heartbeat`, port 8443, chosen because the university firewall lets it out). Every watcher calls it after each
 run (`HB_URL` in its `.env`). A name that stays silent for 25 minutes raises an alert, and another when it
 returns. This catches what a self-watching host cannot report: its own death, or its whole network going down.
 `/status/<secret>` shows all names; `/forget/<secret>/<name>` retires one.
