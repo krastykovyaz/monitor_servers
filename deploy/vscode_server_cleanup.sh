@@ -1,5 +1,5 @@
 #!/bin/bash
-# Trim ~/.vscode-server for the current user: keep the newest server build and anything in use,
+# Trim ~/.vscode-server and ~/.cursor-server for the current user: keep the newest server build and anything in use,
 # remove older builds, half-downloaded ones, stale launcher processes and old caches.
 # Safe to run from cron. Usage: vscode_server_cleanup.sh [--dry]
 set -u
@@ -51,5 +51,23 @@ done
 [ -d "$V/data/CachedExtensionVSIXs" ] && run find "$V/data/CachedExtensionVSIXs" -type f -mtime +14 -delete
 [ -d "$V/data/logs" ] && run find "$V/data/logs" -type f -mtime +14 -delete
 
+# 5. Cursor server builds: keep the newest and anything in use
+CB="$HOME/.cursor-server/bin"; [ -d "$CB/linux-x64" ] && CB="$CB/linux-x64"
+cbefore=0; cafter=0
+if [ -d "$CB" ]; then
+  cbefore=$(du -sm "$HOME/.cursor-server" | cut -f1)
+  cinuse=$( { ls -l /proc/[0-9]*/exe /proc/[0-9]*/cwd 2>/dev/null; ps -eo args; } | grep -oE "cursor-server/bin/(linux-x64/)?[0-9a-f]{20,}" | sed 's#.*/##' | sort -u)
+  cnewest=$(ls -td "$CB"/*/ 2>/dev/null | head -1); cnewest=$(basename "${cnewest:-/none}")
+  for d in "$CB"/*/; do
+    [ -d "$d" ] || continue
+    b=$(basename "$d")
+    echo "$b" | grep -qE '^[0-9a-f]{20,}$' || continue
+    [ "$b" = "$cnewest" ] && { echo "  keep   cursor $b (newest)"; continue; }
+    echo "$cinuse" | grep -qxF "$b" && { echo "  keep   cursor $b (in use)"; continue; }
+    echo "  remove cursor $b ($(du -sh "$d" | cut -f1))"; run rm -rf -- "$d"
+  done
+  cafter=$(du -sm "$HOME/.cursor-server" | cut -f1)
+fi
+
 after=$(du -sm "$V" | cut -f1)
-echo "  size: ${before} MB -> ${after} MB, freed $((before - after)) MB; disk now $(df -h --output=pcent "$HOME" | tail -1 | tr -d ' ') used"
+echo "  size: $((before + cbefore)) MB -> $((after + cafter)) MB, freed $((before + cbefore - after - cafter)) MB; disk now $(df -h --output=pcent "$HOME" | tail -1 | tr -d ' ') used"
