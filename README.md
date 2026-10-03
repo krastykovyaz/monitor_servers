@@ -27,6 +27,9 @@ and every Docker container (state, RAM, memory limit, OOM kills, restarts). It k
 - a host becomes unreachable or reboots
 - a port that was steadily listening on a public interface stops listening
 
+Apps run by PM2 are discovered automatically and followed like services. Processes and ports that belong to
+no service can be declared per host in `expect.conf`; a missing one alerts.
+
 Besides custom units in `/etc/systemd/system`, it follows nginx, apache2, postgresql, openvpn, wireguard, docker,
 redis, mysql/mariadb and mongod when they are installed.
 

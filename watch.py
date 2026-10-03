@@ -10,7 +10,7 @@ grows abnormally or changes state.
   watch.py --show [host]   print the current per-service table and exit
   watch.py --digest [host] send the per-service digest to Telegram (add --dry to print it)
 """
-import fnmatch, html, json, os, statistics, subprocess, sys, time
+import fnmatch, html, json, os, re, statistics, subprocess, sys, time
 import urllib.parse, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -77,6 +77,21 @@ if command -v docker >/dev/null 2>&1 && docker ps >/dev/null 2>&1; then
     echo "C|${i#/}|mem=$cur|oom_kill=$oom|anon=$an"
   done
 fi
+# processes declared in expect.conf
+OLDIFS=$IFS; IFS=,
+for pat in ${EXPECT_PROCS:-}; do [ -n "$pat" ] && echo "X|$pat|count=$(pgrep -fc -- "$pat" 2>/dev/null)"; done
+IFS=$OLDIFS
+echo "LA|ports=$(ss -tlnH 2>/dev/null | awk '{print $4}' | sed 's/.*://' | sort -un | paste -sd, -)"
+# apps run by PM2 (not systemd-managed)
+if command -v pm2 >/dev/null 2>&1 && pgrep -f "PM2 v" >/dev/null 2>&1; then
+  pm2 jlist 2>/dev/null | python3 -c 'import sys, json
+try:
+    for a in json.load(sys.stdin):
+        e = a.get("pm2_env", {})
+        print("M|%s|status=%s|restarts=%s|mem=%s" % (a.get("name"), e.get("status"), e.get("restart_time"), a.get("monit", {}).get("memory")))
+except Exception:
+    pass'
+fi
 echo "END"
 '''
 
@@ -99,6 +114,17 @@ def load_cfg():
         if k in cfg:
             cfg[k] = v if k == "MUTE" else float(v)
     return cfg
+
+
+def load_expect():
+    """expect.conf: host | proc | pattern   and   host | port | number"""
+    exp, path = {}, DIR / "expect.conf"
+    if path.exists():
+        for line in path.read_text().splitlines():
+            p = [x.strip() for x in line.split("#")[0].split("|")]
+            if len(p) == 3 and p[1] in ("proc", "port") and re.fullmatch(r"[A-Za-z0-9_.@/+-]+", p[2]):
+                exp.setdefault(p[0], {"proc": [], "port": []})[p[1]].append(p[2])
+    return exp
 
 
 def load_servers():
@@ -137,7 +163,8 @@ def kv(parts):
 
 
 def parse(out):
-    data = {"host": {}, "services": {}, "containers": {}, "failed": [], "du": {}, "ports": []}
+    data = {"host": {}, "services": {}, "containers": {}, "failed": [], "du": {}, "ports": [],
+            "allports": [], "procs": {}, "pm2": {}}
     complete = False
     for line in out.splitlines():
         parts = line.strip().split("|")
@@ -150,6 +177,12 @@ def parse(out):
             data["services"][parts[1]] = kv(parts[2:])
         elif t == "C" and len(parts) > 2:
             data["containers"][parts[1]] = kv(parts[2:])
+        elif t == "LA":
+            data["allports"] = [x for x in kv(parts[1:]).get("ports", "").split(",") if x]
+        elif t == "X" and len(parts) > 2:
+            data["procs"][parts[1]] = num(kv(parts[2:]).get("count"))
+        elif t == "M" and len(parts) > 2:
+            data["pm2"][parts[1]] = kv(parts[2:])
         elif t == "L":
             data["ports"] = [x for x in kv(parts[1:]).get("ports", "").split(",") if x]
         elif t == "F" and len(parts) > 1:
@@ -159,15 +192,16 @@ def parse(out):
     return data if complete and data["host"] else None
 
 
-def collect(server, env, with_du):
+def collect(server, env, with_du, expect=None):
     name, target, port = server
+    script = 'EXPECT_PROCS="%s"\n' % ",".join((expect or {}).get(name, {}).get("proc", [])) + COLLECT
     cmd = ["ssh", "-p", port, "-o", "IPQoS=none", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
            "-o", "StrictHostKeyChecking=accept-new", "-o", "LogLevel=ERROR", "-o", "ClearAllForwardings=yes"]
     if env.get("SSH_KEY"):
         cmd += ["-i", env["SSH_KEY"]]
     cmd += [target, ("DU=1 " if with_du else "") + "bash -s"]
     try:
-        r = subprocess.run(cmd, input=COLLECT, capture_output=True, text=True, timeout=300 if with_du else 90)
+        r = subprocess.run(cmd, input=script, capture_output=True, text=True, timeout=300 if with_du else 90)
         return name, parse(r.stdout)
     except Exception:
         return name, None
@@ -187,8 +221,8 @@ def dur(sec):
 
 
 class Watch:
-    def __init__(self, state, cfg, now):
-        self.s, self.cfg, self.now = state, cfg, now
+    def __init__(self, state, cfg, now, expect=None):
+        self.s, self.cfg, self.now, self.expect = state, cfg, now, expect or {}
         for k in ("active", "pending", "cooldown", "hist", "seen", "prev", "fails", "ports"):
             self.s.setdefault(k, {})
         self.mutes = [m.strip() for m in str(cfg["MUTE"]).split(",") if m.strip()]
@@ -382,6 +416,32 @@ class Watch:
                 self.event(k + ":restart", "%s — restarted %d time(s), %d total" % (Cn, r - pr, r), baseline=baseline)
         self.drop("%s:ctr:" % name, set(d["containers"]))
 
+        # declared processes and ports (expect.conf)
+        exp = self.expect.get(name, {})
+        for pat in exp.get("proc", []):
+            cnt = d["procs"].get(pat)
+            if cnt is not None:
+                self.cond("%s:proc:%s" % (name, pat), cnt == 0, "%s · process %s — not running" % (B, html.escape(pat)),
+                          confirm=2, baseline=baseline, ok="running")
+        for port in exp.get("port", []):
+            self.cond("%s:eport:%s" % (name, port), port not in d["allports"], "%s · port %s — nothing is listening" % (B, port),
+                      confirm=2, baseline=baseline, ok="listening")
+
+        # PM2 apps
+        ppm = prev.get("pm2", {})
+        for app, f in d["pm2"].items():
+            A = "%s · pm2 app %s" % (B, html.escape(app))
+            k = "%s:pm2:%s" % (name, app)
+            self.cond(k + ":state", f.get("status") != "online", "%s — is %s" % (A, f.get("status")), confirm=2,
+                      baseline=baseline, ok="online", unconfirm=2)
+            r, pr = num(f.get("restarts")), ppm.get(app, {}).get("restarts")
+            if r is not None and pr is not None and r > pr:
+                self.event(k + ":restart", "%s — restarted %d time(s), %d total" % (A, r - pr, r), baseline=baseline)
+            m = num(f.get("mem"))
+            if m and f.get("status") == "online":
+                self.growth(k + ":mem", A, m, ram, baseline or app not in ppm)
+        self.drop("%s:pm2:" % name, set(d["pm2"]))
+
         # listening ports: one that was steadily open disappears
         first = name not in s["ports"]
         pc, cur = s["ports"].setdefault(name, {}), set(d["ports"])
@@ -416,6 +476,7 @@ class Watch:
         s["prev"][name] = {
             "uptime_s": h.get("uptime_s"), "failed": d["failed"], "du": du,
             "services": {u: {"restarts": num(f.get("NRestarts"))} for u, f in d["services"].items()},
+            "pm2": {a: {"restarts": num(f.get("restarts"))} for a, f in d["pm2"].items()},
             "containers": {cn: {"state": f.get("state"), "oom_kill": num(f.get("oom_kill")), "restarts": num(f.get("restarts"))}
                            for cn, f in d["containers"].items()},
         }
@@ -444,6 +505,10 @@ def show(results, only=None):
             lim, a = num(f.get("limit")), num(f.get("anon"))
             print("  [container] %-24s %-10s ram %s (%s with cache)%s  oom kills %s  restarts %s" % (
                 cn, f.get("state"), mb(a), mb(num(f.get("mem"))), (" of %s limit" % mb(lim)) if lim else "", f.get("oom_kill") or "-", f.get("restarts")))
+        for app, f in sorted(d["pm2"].items()):
+            print("  [pm2] %-30s %-10s ram %-8s restarts %s" % (app, f.get("status"), mb(num(f.get("mem"))), f.get("restarts")))
+        for pat, cnt in sorted(d["procs"].items()):
+            print("  [expected process] %-17s %s" % (pat, "running (%d)" % cnt if cnt else "NOT RUNNING"))
         if d["failed"]:
             print("  failed units: " + ", ".join(d["failed"]))
         if d["ports"]:
@@ -492,6 +557,13 @@ def digest(results, state, now, only=None):
                 rows.append((m, "▣ " + cn, extra + trend("%s:ctr:%s:mem" % (name, cn), m)))
             elif f.get("state") in ("restarting", "dead"):
                 down.append("container %s (%s)" % (cn, f.get("state")))
+        for app, f in d["pm2"].items():
+            if f.get("status") == "online":
+                m = num(f.get("mem")) or 0
+                rows.append((m, "◆ " + app, trend("%s:pm2:%s:mem" % (name, app), m)))
+            else:
+                down.append("pm2 app %s (%s)" % (app, f.get("status")))
+        down += ["process %s" % pat for pat, cnt in d["procs"].items() if cnt == 0]
         rows.sort(reverse=True)
         if rows:
             lines = ["%-24s %7s%s" % (html.escape(u[:24]), mb(m), html.escape(x)) for m, u, x in rows[:10]]
@@ -536,9 +608,9 @@ def main():
     state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
     first_run = not state.get("seen")
     with_du = do_show or (not do_digest and now - state.get("last_du", 0) > 20 * 3600)
-    servers = load_servers()
+    servers, expect = load_servers(), load_expect()
     with ThreadPoolExecutor(max_workers=len(servers)) as ex:
-        results = list(ex.map(lambda s: collect(s, env, with_du), servers))
+        results = list(ex.map(lambda s: collect(s, env, with_du, expect), servers))
     if do_show:
         show(results, only)
         return
@@ -551,7 +623,7 @@ def main():
             print("%s digest sent" % time.strftime("%F %T"))
         return
 
-    w = Watch(state, cfg, now)
+    w = Watch(state, cfg, now, expect)
     never = []
     for name, d in results:
         if d:
