@@ -25,6 +25,10 @@ and every Docker container (state, RAM, memory limit, OOM kills, restarts). It k
 - root disk passes 85% or 93%, or grows more than 3 GB in a day; a service folder grows 30% and 300 MB in a day
 - available RAM drops under 8%, swap passes 90%, load stays above 2x the CPU count
 - a host becomes unreachable or reboots
+- a port that was steadily listening on a public interface stops listening
+
+Besides custom units in `/etc/systemd/system`, it follows nginx, apache2, postgresql, openvpn, wireguard, docker,
+redis, mysql/mariadb and mongod when they are installed.
 
 Each condition alerts once when it starts and once when it clears. Conditions already true on the first run
 are listed once as "already abnormal" and stay quiet. Thresholds and mutes live in `watch.conf`.

@@ -42,13 +42,24 @@ mt=$(awk '/^MemTotal:/{print $2}' /proc/meminfo); ma=$(awk '/^MemAvailable:/{pri
 st=$(awk '/^SwapTotal:/{print $2}' /proc/meminfo); sf=$(awk '/^SwapFree:/{print $2}' /proc/meminfo)
 set -- $(df -Pk / | awk 'NR==2{print $2, $3}')
 echo "H|cpus=$(nproc)|load1=$(cut -d' ' -f1 /proc/loadavg)|disk_total_kb=$1|disk_used_kb=$2|mem_total_kb=$mt|mem_avail_kb=$ma|swap_total_kb=$st|swap_free_kb=$sf|uptime_s=$(cut -d. -f1 /proc/uptime)"
+svc() {
+  cg=$(systemctl show "$1.service" -p ControlGroup --value 2>/dev/null); an=
+  [ -n "$cg" ] && [ -r "/sys/fs/cgroup$cg/memory.stat" ] && an=$(awk '/^(anon|shmem) /{s+=$2} END{print s}' "/sys/fs/cgroup$cg/memory.stat")
+  echo "S|$1|$(systemctl show "$1.service" -p ActiveState,SubState,UnitFileState,MemoryCurrent,NRestarts,Type,WorkingDirectory 2>/dev/null | paste -sd'|' -)|Anon=$an"
+}
+# well-known package services, when installed
+for u in $(systemctl list-units --type=service --all --no-legend --plain 'nginx.service' 'apache2.service' 'postgresql@*.service' 'openvpn-server@*.service' 'openvpn@*.service' 'wg-quick@*.service' 'docker.service' 'redis-server.service' 'mysql.service' 'mariadb.service' 'mongod.service' 2>/dev/null | awk '{print $1}'); do
+  u=${u%.service}
+  [ -f "/etc/systemd/system/$u.service" ] && [ ! -L "/etc/systemd/system/$u.service" ] && continue
+  svc "$u"
+done
+# listeners reachable from outside (loopback-only ones are ignored)
+echo "L|ports=$(ss -tlnH 2>/dev/null | awk '{print $4}' | grep -vE '^(127\.|\[::1\])' | sed 's/.*://' | sort -un | paste -sd, -)"
 for f in /etc/systemd/system/*.service; do
   [ -f "$f" ] && [ ! -L "$f" ] || continue
   u=$(basename "$f" .service)
   case "$u" in *@|snap.*|cloud-*|ssh|sshd*|dbus-*|qemu-guest*|do-agent*|droplet-agent*) continue;; esac
-  cg=$(systemctl show "$u.service" -p ControlGroup --value 2>/dev/null); an=
-  [ -n "$cg" ] && [ -r "/sys/fs/cgroup$cg/memory.stat" ] && an=$(awk '/^(anon|shmem) /{s+=$2} END{print s}' "/sys/fs/cgroup$cg/memory.stat")
-  echo "S|$u|$(systemctl show "$u.service" -p ActiveState,SubState,UnitFileState,MemoryCurrent,NRestarts,Type,WorkingDirectory 2>/dev/null | paste -sd'|' -)|Anon=$an"
+  svc "$u"
   if [ "${DU:-0}" = 1 ]; then
     wd=$(systemctl show "$u.service" -p WorkingDirectory --value 2>/dev/null)
     case "$wd" in ""|/|/root|/root/|/home/*/*) ;; /home/*) wd="";; esac
@@ -126,7 +137,7 @@ def kv(parts):
 
 
 def parse(out):
-    data = {"host": {}, "services": {}, "containers": {}, "failed": [], "du": {}}
+    data = {"host": {}, "services": {}, "containers": {}, "failed": [], "du": {}, "ports": []}
     complete = False
     for line in out.splitlines():
         parts = line.strip().split("|")
@@ -139,6 +150,8 @@ def parse(out):
             data["services"][parts[1]] = kv(parts[2:])
         elif t == "C" and len(parts) > 2:
             data["containers"][parts[1]] = kv(parts[2:])
+        elif t == "L":
+            data["ports"] = [x for x in kv(parts[1:]).get("ports", "").split(",") if x]
         elif t == "F" and len(parts) > 1:
             data["failed"].append(parts[1])
         elif t == "D" and len(parts) > 2:
@@ -176,7 +189,7 @@ def dur(sec):
 class Watch:
     def __init__(self, state, cfg, now):
         self.s, self.cfg, self.now = state, cfg, now
-        for k in ("active", "pending", "cooldown", "hist", "seen", "prev", "fails"):
+        for k in ("active", "pending", "cooldown", "hist", "seen", "prev", "fails", "ports"):
             self.s.setdefault(k, {})
         self.mutes = [m.strip() for m in str(cfg["MUTE"]).split(",") if m.strip()]
         self.fired, self.resolved, self.known = [], [], []
@@ -368,6 +381,24 @@ class Watch:
                 self.event(k + ":restart", "%s — restarted %d time(s), %d total" % (Cn, r - pr, r), baseline=baseline)
         self.drop("%s:ctr:" % name, set(d["containers"]))
 
+        # listening ports: one that was steadily open disappears
+        first = name not in s["ports"]
+        pc, cur = s["ports"].setdefault(name, {}), set(d["ports"])
+        for p in cur:
+            pc[p] = 6 if first else min(pc.get(p, 0) + 1, 6)
+        for p in list(pc):
+            k = "%s:port:%s" % (name, p)
+            if p in cur:
+                self.cond(k, False, "", ok="listening again")
+            elif pc[p] >= 6:
+                a = s["active"].get(k)
+                if a and self.now - a["since"] > 24 * 3600:      # gone for a day: accept it as removed
+                    s["active"].pop(k, None); pc.pop(p, None)
+                else:
+                    self.cond(k, True, "%s · port %s — stopped listening" % (B, p), confirm=2)
+            else:
+                pc.pop(p, None)
+
         # daily folder sizes
         for u, f in d["du"].items():
             kb = num(f.get("kb"))
@@ -414,6 +445,8 @@ def show(results, only=None):
                 cn, f.get("state"), mb(a), mb(num(f.get("mem"))), (" of %s limit" % mb(lim)) if lim else "", f.get("oom_kill") or "-", f.get("restarts")))
         if d["failed"]:
             print("  failed units: " + ", ".join(d["failed"]))
+        if d["ports"]:
+            print("  listening: " + ", ".join(sorted(d["ports"], key=int)))
 
 
 def digest(results, state, now, only=None):
@@ -470,6 +503,8 @@ def digest(results, state, now, only=None):
             extra_failed = [u for u in d["failed"] if u[:-8] not in d["services"]]
             if extra_failed:
                 out.append("⛔ failed units: " + html.escape(", ".join(extra_failed)))
+        if d["ports"]:
+            out.append("ports: " + ", ".join(sorted(d["ports"], key=int)))
         fresh = [a["text"] for k, a in active.items() if k.startswith(name + ":") and not a.get("known")]
         for t in fresh:
             out.append("🚨 " + t)
