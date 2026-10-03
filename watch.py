@@ -8,6 +8,7 @@ grows abnormally or changes state.
   watch.py            collect, evaluate, alert, save state   (cron, every 10 min)
   watch.py --dry      collect and evaluate, print what would be sent, change nothing
   watch.py --show [host]   print the current per-service table and exit
+  watch.py --digest [host] send the per-service digest to Telegram (add --dry to print it)
 """
 import fnmatch, html, json, os, statistics, subprocess, sys, time
 import urllib.parse, urllib.request
@@ -415,6 +416,68 @@ def show(results, only=None):
             print("  failed units: " + ", ".join(d["failed"]))
 
 
+def digest(results, state, now, only=None):
+    """The per-service picture we used to collect by hand, as one Telegram message."""
+    hist, active = state.get("hist", {}), state.get("active", {})
+
+    def trend(key, cur):
+        old = [v for t, v in hist.get(key, []) if now - t >= 6 * 3600]
+        if not old or not old[0]:
+            return ""
+        d = cur - old[0]
+        if abs(d) < 20 * 1048576 or abs(d) < old[0] * 0.2:
+            return ""
+        return "  %s%+d%% in %dh" % ("▲" if d > 0 else "▼", round(d * 100.0 / old[0]), round((now - hist[key][0][0]) / 3600))
+
+    out, missing = ["📊 <b>Resource digest</b> " + time.strftime("%Y-%m-%d %H:%M", time.localtime(now))], []
+    for name, d in results:
+        if only and name != only:
+            continue
+        if not d:
+            missing.append(name)
+            continue
+        h = d["host"]
+        g = lambda k: num(h.get(k)) or 0
+        swap = ("%d%%" % round((g("swap_total_kb") - g("swap_free_kb")) * 100.0 / g("swap_total_kb"))) if g("swap_total_kb") else "none"
+        out.append("\n<b>%s</b> — disk %d%% (%.1f GB free) · RAM %.1f of %.1f GB free · swap %s · load %s on %s cpu" % (
+            html.escape(name), round(g("disk_used_kb") * 100.0 / max(1, g("disk_total_kb"))),
+            (g("disk_total_kb") - g("disk_used_kb")) / 1048576.0, g("mem_avail_kb") / 1048576.0, g("mem_total_kb") / 1048576.0,
+            swap, h.get("load1"), h.get("cpus")))
+        rows, down = [], []
+        for u, f in d["services"].items():
+            m = svc_mem(f)
+            if f.get("ActiveState") == "active" and m is not None:
+                rows.append((m, u, trend("%s:svc:%s:mem" % (name, u), m)))
+            elif f.get("UnitFileState", "").startswith("enabled") and f.get("Type") != "oneshot" and f.get("ActiveState") != "active":
+                down.append("%s (%s)" % (u, f.get("SubState", f.get("ActiveState", "?"))))
+        for cn, f in d["containers"].items():
+            if f.get("state") == "running":
+                a, lim = num(f.get("anon")), num(f.get("limit"))
+                m = a if a is not None else (num(f.get("mem")) or 0)
+                extra = (" of %s" % mb(lim) if lim else "") + ("  oom kills %s" % f["oom_kill"] if num(f.get("oom_kill")) else "")
+                rows.append((m, "▣ " + cn, extra + trend("%s:ctr:%s:mem" % (name, cn), m)))
+            elif f.get("state") in ("restarting", "dead"):
+                down.append("container %s (%s)" % (cn, f.get("state")))
+        rows.sort(reverse=True)
+        if rows:
+            lines = ["%-24s %7s%s" % (html.escape(u[:24]), mb(m), html.escape(x)) for m, u, x in rows[:10]]
+            if len(rows) > 10:
+                lines.append("… %d more, %s together" % (len(rows) - 10, mb(sum(r[0] for r in rows[10:]))))
+            out.append("<pre>" + "\n".join(lines) + "</pre>")
+        if down:
+            out.append("⛔ not running: " + html.escape(", ".join(down)))
+        if d["failed"]:
+            extra_failed = [u for u in d["failed"] if u[:-8] not in d["services"]]
+            if extra_failed:
+                out.append("⛔ failed units: " + html.escape(", ".join(extra_failed)))
+        fresh = [a["text"] for k, a in active.items() if k.startswith(name + ":") and not a.get("known")]
+        for t in fresh:
+            out.append("🚨 " + t)
+    if missing:
+        out.append("\nNot reachable from here: " + ", ".join(missing))
+    return "\n".join(out)
+
+
 def send(env, text):
     chunks, cur = [], ""
     for line in text.split("\n"):
@@ -431,17 +494,25 @@ def send(env, text):
 
 def main():
     args = sys.argv[1:]
-    dry, do_show = "--dry" in args, "--show" in args
+    dry, do_show, do_digest = "--dry" in args, "--show" in args, "--digest" in args
     only = next((a for a in args if not a.startswith("--")), None)
     env, cfg, now = load_kv(DIR / ".env"), load_cfg(), time.time()
     state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
     first_run = not state.get("seen")
-    with_du = do_show or (now - state.get("last_du", 0) > 20 * 3600)
+    with_du = do_show or (not do_digest and now - state.get("last_du", 0) > 20 * 3600)
     servers = load_servers()
     with ThreadPoolExecutor(max_workers=len(servers)) as ex:
         results = list(ex.map(lambda s: collect(s, env, with_du), servers))
     if do_show:
         show(results, only)
+        return
+    if do_digest:
+        text = digest(results, state, now, only)
+        if dry:
+            print(text)
+        else:
+            send(env, text)
+            print("%s digest sent" % time.strftime("%F %T"))
         return
 
     w = Watch(state, cfg, now)

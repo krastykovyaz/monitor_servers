@@ -31,3 +31,8 @@ are listed once as "already abnormal" and stay quiet. Thresholds and mutes live 
 
     ./watch.py --show [host]   # the per-service table, on demand
     ./watch.py --dry           # evaluate and print, send nothing, save nothing
+
+    ./watch.py --digest [host]  # send the per-service digest to Telegram; add --dry to print it
+
+The digest also goes out daily at 05:05 from cron. `deploy/vpn_bot_resources_cmd.py` adds a `/resources [host]`
+command to the Telegram bot for the same digest on demand.
