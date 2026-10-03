@@ -40,7 +40,7 @@ COLLECT = r'''
 export LC_ALL=C
 mt=$(awk '/^MemTotal:/{print $2}' /proc/meminfo); ma=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
 st=$(awk '/^SwapTotal:/{print $2}' /proc/meminfo); sf=$(awk '/^SwapFree:/{print $2}' /proc/meminfo)
-set -- $(df -Pk / | awk 'NR==2{print $2, $3}')
+set -- $(df -Pk / | awk 'NR==2{print $3 + $4, $3}')   # usable size (used + available), like the df percentage
 echo "H|cpus=$(nproc)|load1=$(cut -d' ' -f1 /proc/loadavg)|disk_total_kb=$1|disk_used_kb=$2|mem_total_kb=$mt|mem_avail_kb=$ma|swap_total_kb=$st|swap_free_kb=$sf|uptime_s=$(cut -d. -f1 /proc/uptime)"
 svc() {
   cg=$(systemctl show "$1.service" -p ControlGroup --value 2>/dev/null); an=
@@ -79,7 +79,14 @@ if command -v docker >/dev/null 2>&1 && docker ps >/dev/null 2>&1; then
 fi
 # processes declared in expect.conf
 OLDIFS=$IFS; IFS=,
-for pat in ${EXPECT_PROCS:-}; do [ -n "$pat" ] && echo "X|$pat|count=$(pgrep -fc -- "$pat" 2>/dev/null)"; done
+for pat in ${EXPECT_PROCS:-}; do
+  [ -n "$pat" ] || continue
+  pids=$(pgrep -f -- "$pat" 2>/dev/null | grep -vx "$$" | paste -sd, -)
+  if [ -n "$pids" ]; then echo "X|$pat|count=$(echo "$pids" | tr ',' '\n' | wc -l)|rss=$(ps -o rss= -p "$pids" 2>/dev/null | awk '{s+=$1} END{printf "%d", s*1024}')"
+  else echo "X|$pat|count=0|rss="; fi
+done
+# folders declared in expect.conf (daily)
+if [ "${DU:-0}" = 1 ]; then for dir in ${EXPECT_DIRS:-}; do [ -d "$dir" ] && echo "D|$dir|kb=$(timeout 120 du -sxk "$dir" 2>/dev/null | cut -f1)"; done; fi
 IFS=$OLDIFS
 echo "LA|ports=$(ss -tlnH 2>/dev/null | awk '{print $4}' | sed 's/.*://' | sort -un | paste -sd, -)"
 # apps run by PM2 (not systemd-managed)
@@ -117,13 +124,13 @@ def load_cfg():
 
 
 def load_expect():
-    """expect.conf: host | proc | pattern   and   host | port | number"""
+    """expect.conf: host | proc | pattern,  host | port | number,  host | dir | /path"""
     exp, path = {}, DIR / "expect.conf"
     if path.exists():
         for line in path.read_text().splitlines():
             p = [x.strip() for x in line.split("#")[0].split("|")]
-            if len(p) == 3 and p[1] in ("proc", "port") and re.fullmatch(r"[A-Za-z0-9_.@/+-]+", p[2]):
-                exp.setdefault(p[0], {"proc": [], "port": []})[p[1]].append(p[2])
+            if len(p) == 3 and p[1] in ("proc", "port", "dir") and re.fullmatch(r"[A-Za-z0-9_.@/+ -]+", p[2]):
+                exp.setdefault(p[0], {"proc": [], "port": [], "dir": []})[p[1]].append(p[2])
     return exp
 
 
@@ -164,7 +171,7 @@ def kv(parts):
 
 def parse(out):
     data = {"host": {}, "services": {}, "containers": {}, "failed": [], "du": {}, "ports": [],
-            "allports": [], "procs": {}, "pm2": {}}
+            "allports": [], "procs": {}, "procrss": {}, "pm2": {}}
     complete = False
     for line in out.splitlines():
         parts = line.strip().split("|")
@@ -180,7 +187,9 @@ def parse(out):
         elif t == "LA":
             data["allports"] = [x for x in kv(parts[1:]).get("ports", "").split(",") if x]
         elif t == "X" and len(parts) > 2:
-            data["procs"][parts[1]] = num(kv(parts[2:]).get("count"))
+            f = kv(parts[2:])
+            data["procs"][parts[1]] = num(f.get("count"))
+            data["procrss"][parts[1]] = num(f.get("rss"))
         elif t == "M" and len(parts) > 2:
             data["pm2"][parts[1]] = kv(parts[2:])
         elif t == "L":
@@ -194,12 +203,15 @@ def parse(out):
 
 def collect(server, env, with_du, expect=None):
     name, target, port = server
-    script = 'EXPECT_PROCS="%s"\n' % ",".join((expect or {}).get(name, {}).get("proc", [])) + COLLECT
+    e = (expect or {}).get(name, {})
+    script = 'EXPECT_PROCS="%s"\nEXPECT_DIRS="%s"\n' % (",".join(e.get("proc", [])), ",".join(e.get("dir", []))) + COLLECT
     cmd = ["ssh", "-p", port, "-o", "IPQoS=none", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
            "-o", "StrictHostKeyChecking=accept-new", "-o", "LogLevel=ERROR", "-o", "ClearAllForwardings=yes"]
     if env.get("SSH_KEY"):
         cmd += ["-i", env["SSH_KEY"]]
     cmd += [target, ("DU=1 " if with_du else "") + "bash -s"]
+    if target == "local":      # watch the machine this runs on, no SSH
+        cmd = ["env", "DU=%d" % (1 if with_du else 0), "bash", "-s"]
     try:
         r = subprocess.run(cmd, input=script, capture_output=True, text=True, timeout=300 if with_du else 90)
         return name, parse(r.stdout)
@@ -423,6 +435,9 @@ class Watch:
             if cnt is not None:
                 self.cond("%s:proc:%s" % (name, pat), cnt == 0, "%s · process %s — not running" % (B, html.escape(pat)),
                           confirm=2, baseline=baseline, ok="running")
+                rss = d["procrss"].get(pat)
+                if cnt and rss:
+                    self.growth("%s:proc:%s:mem" % (name, pat), "%s · process %s" % (B, html.escape(pat)), rss, ram, baseline)
         for port in exp.get("port", []):
             self.cond("%s:eport:%s" % (name, port), port not in d["allports"], "%s · port %s — nothing is listening" % (B, port),
                       confirm=2, baseline=baseline, ok="listening")
@@ -508,7 +523,10 @@ def show(results, only=None):
         for app, f in sorted(d["pm2"].items()):
             print("  [pm2] %-30s %-10s ram %-8s restarts %s" % (app, f.get("status"), mb(num(f.get("mem"))), f.get("restarts")))
         for pat, cnt in sorted(d["procs"].items()):
-            print("  [expected process] %-17s %s" % (pat, "running (%d)" % cnt if cnt else "NOT RUNNING"))
+            print("  [expected process] %-26s %s" % (pat, "running (%d), ram %s" % (cnt, mb(d["procrss"].get(pat))) if cnt else "NOT RUNNING"))
+        for u, f in sorted(d["du"].items()):
+            if u.startswith("/"):
+                print("  [folder] %-36s %s" % (u, mb((num(f.get("kb")) or 0) * 1024)))
         if d["failed"]:
             print("  failed units: " + ", ".join(d["failed"]))
         if d["ports"]:
@@ -564,6 +582,9 @@ def digest(results, state, now, only=None):
             else:
                 down.append("pm2 app %s (%s)" % (app, f.get("status")))
         down += ["process %s" % pat for pat, cnt in d["procs"].items() if cnt == 0]
+        for pat, cnt in d["procs"].items():
+            if cnt and d["procrss"].get(pat):
+                rows.append((d["procrss"][pat], "● " + pat, trend("%s:proc:%s:mem" % (name, pat), d["procrss"][pat])))
         rows.sort(reverse=True)
         if rows:
             lines = ["%-24s %7s%s" % (html.escape(u[:24]), mb(m), html.escape(x)) for m, u, x in rows[:10]]
