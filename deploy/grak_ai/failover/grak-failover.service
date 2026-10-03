@@ -1,0 +1,6 @@
+[Unit]
+Description=grak_ai failover check (start the bot here if the lab stops renewing its lease)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/grak-failover

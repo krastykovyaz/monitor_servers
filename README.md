@@ -65,3 +65,24 @@ A small receiver on horek_ge (systemd unit `monitor-heartbeat` on 127.0.0.1:8787
 run (`HB_URL` in its `.env`). A name that stays silent for 25 minutes raises an alert, and another when it
 returns. This catches what a self-watching host cannot report: its own death, or its whole network going down.
 `/status/<secret>` shows all names; `/forget/<secret>/<name>` retires one.
+
+## grak_ai failover (`deploy/grak_ai/failover/`)
+
+grak_ai runs in the lab (aak-third, tmux `news`). horek_ge holds a standby copy that starts automatically if
+the lab goes silent, and never while the lab copy may still be running.
+
+- **Lab guard** (`grak_guard.sh`, cron every minute as alex): renews a lease on horek_ge through a key that can
+  only run `/usr/local/sbin/grak-gate` (renew, status, write-only snapshot upload), from 158.64.79.0/24. Every
+  5 minutes it uploads consistent SQLite backups of the content database, the Telegram session and the shared
+  dedup registry. It restarts the lab bot if it died. If it cannot renew for 5 minutes it stops the lab bot,
+  unless horek_ge is completely offline while Telegram is reachable (then nobody can take over).
+- **horek_ge watchdog** (`grak-failover`, systemd timer every minute): takes over only when the lease is over
+  10 minutes old on 3 consecutive checks, aak-third's monitoring heartbeat has been silent for 15 minutes, and
+  horek_ge itself has internet and 15 minutes of uptime. It records `owner=horek_ge` before starting the bot,
+  so the lab guard then keeps the lab copy stopped. Alerts go to Telegram.
+- **Switching back** is deliberate: `bash deploy/grak_ai/failover/failback.sh` from the Mac.
+- **Maintenance in the lab:** `touch ~/.local/share/grak_guard/paused` stops the guard from restarting the bot.
+- State: `/var/lib/grak-failover/{owner,lease,standby/,failover.log}` on horek_ge, `~/.local/share/grak_guard/` on aak-third.
+
+Known limit: if the cron daemon on aak-third stops while the VM and the bot keep running, both the lease and
+the heartbeat stop, and horek_ge would start a second copy.

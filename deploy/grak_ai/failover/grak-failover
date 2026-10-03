@@ -1,0 +1,73 @@
+#!/bin/bash
+# horek_ge: /usr/local/sbin/grak-failover, run every minute by grak-failover.timer.
+# Starts grak_ai here when the lab stops renewing its lease, and keeps it running while horek_ge owns it.
+#
+# Safety rules, so the lab and horek_ge never run the bot at the same time:
+#  - the lab guard stops its own copy after 5 minutes without a renewal;
+#  - this host takes over only after the lease is 10 minutes old on 3 consecutive checks, aak-third's
+#    monitoring heartbeat has been silent for 15 minutes, this host has internet and has been up 15 minutes;
+#  - ownership is recorded before the bot starts, so a late renewal from the lab is told to stand down.
+set -u
+D=/var/lib/grak-failover; APP=/opt/grak_ai; SVC=grak-ai
+LEASE_MAX=600; CHECKS=3; MIN_UPTIME=900
+HB_MAX=900      # aak-third reports every 5 minutes; 15 minutes of silence means the host is down or cut off
+mkdir -p "$D/standby"; chmod 700 "$D"
+[ -f "$D/owner" ] || echo lab > "$D/owner"
+owner=$(cat "$D/owner")
+log() { echo "$(date '+%F %T') $*" >> "$D/failover.log"; }
+alert() {
+  ( set -a; . /root/monitor_servers/.env; set +a
+    printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$TG_BOT_TOKEN" |
+      curl -s -m 15 -o /dev/null -K - --data-urlencode "chat_id=$TG_CHAT_ID" --data-urlencode "text=$1" ) || true
+}
+
+if [ "$owner" = horek_ge ]; then
+  if ! systemctl is-active --quiet "$SVC"; then
+    systemctl reset-failed "$SVC" 2>/dev/null; systemctl start "$SVC"
+    log "owner is horek_ge and $SVC was not running; started it"
+  fi
+  exit 0
+fi
+
+# The lab owns the bot: it must never run here.
+if systemctl is-active --quiet "$SVC"; then
+  systemctl stop "$SVC"; log "owner is lab but $SVC was running here; stopped it"
+  alert "⚠️ grak_ai: found running on horek_ge while the lab owns it. Stopped it on horek_ge."
+fi
+
+age=$(( $(date +%s) - $(stat -c %Y "$D/lease" 2>/dev/null || echo 0) ))
+if [ "$age" -le "$LEASE_MAX" ]; then echo 0 > "$D/expired_count"; exit 0; fi
+
+up=$(cut -d. -f1 /proc/uptime)
+if [ "$up" -lt "$MIN_UPTIME" ] || ! curl -s -m 10 -o /dev/null https://api.telegram.org/; then
+  echo 0 > "$D/expired_count"; log "lease is $age s old but this host is not ready (uptime $up s or no internet)"; exit 0
+fi
+n=$(( $(cat "$D/expired_count" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$D/expired_count"
+if [ "$n" -lt "$CHECKS" ]; then log "lease is $age s old, check $n of $CHECKS"; exit 0; fi
+
+# Second witness: aak-third's monitoring heartbeat comes from a separate job. If it is still fresh, the lab
+# host is alive and only the guard is broken, so its bot may still be running: hold and alert, never start a second copy.
+hb_age=$( ( set -a; . /etc/monitor-heartbeat.env; set +a
+  curl -s -m 5 "http://127.0.0.1:${HB_PORT:-8787}/status/$HB_SECRET" |
+    python3 -c "import sys, json; print(json.load(sys.stdin).get('aak-third', {}).get('age_s', 999999))" ) 2>/dev/null || echo 999999)
+if [ "$hb_age" -lt "$HB_MAX" ]; then
+  log "lease is $age s old but aak-third's monitoring heartbeat is $hb_age s old; the lab is alive, not taking over"
+  [ "$n" -eq "$CHECKS" ] && alert "⚠️ grak_ai: the lab stopped renewing its lease, but aak-third itself is alive. Not taking over, to avoid two copies. Check ~/.local/share/grak_guard/guard.log on aak-third."
+  exit 0
+fi
+
+if [ ! -s "$D/standby/content_database.db" ] || [ ! -s "$D/standby/session2.session" ]; then
+  log "lease expired but there is no standby snapshot; cannot take over"
+  [ "$n" -eq "$CHECKS" ] && alert "❌ grak_ai: the lab is silent but horek_ge has no state snapshot, so it cannot take over."
+  exit 1
+fi
+
+echo horek_ge > "$D/owner"
+snap=$(( ($(date +%s) - $(stat -c %Y "$D/standby/content_database.db")) / 60 ))
+install -o grakai -g grakai -m 640 "$D/standby/content_database.db" "$APP/content_database.db"
+install -o grakai -g grakai -m 600 "$D/standby/session2.session" "$APP/session2.session"
+[ -s "$D/standby/test_group_dedup.db" ] && install -o grakai -g grakai -m 640 "$D/standby/test_group_dedup.db" "$APP/test_group_dedup.db"
+rm -f "$APP/content_database.db-wal" "$APP/content_database.db-shm"
+systemctl reset-failed "$SVC" 2>/dev/null; systemctl start "$SVC"
+log "TAKEOVER: lease $age s old; started $SVC with a $snap min old snapshot"
+alert "🔁 grak_ai failover: the lab has not checked in for $(( age / 60 )) min. Started the bot on horek_ge with state from $snap min ago. Switch back with deploy/grak_ai/failover/failback.sh"
