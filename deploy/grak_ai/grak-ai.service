@@ -1,0 +1,31 @@
+[Unit]
+Description=grak_ai news bot (Telegram channels to VK), moved from aak-third
+After=network-online.target
+Wants=network-online.target
+# A broken Telegram session makes the bot ask for a login code on stdin, which a service cannot answer.
+# Stop retrying after 3 failures in 10 minutes instead of looping forever.
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+User=grakai
+Group=grakai
+WorkingDirectory=/opt/grak_ai
+ExecStart=/opt/grak_ai/venv/bin/python3 -u main.py
+# The bot schedules by local clock time; it ran on UTC in the lab, horek_ge runs on Moscow time.
+Environment=TZ=Etc/UTC
+Environment=PYTHONUNBUFFERED=1
+Environment=TEST_GROUP_DEDUP_DB_PATH=/opt/grak_ai/test_group_dedup.db
+StandardOutput=append:/opt/grak_ai/grak_prod.log
+StandardError=inherit
+Restart=on-failure
+RestartSec=30
+MemoryMax=500M
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/grak_ai
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

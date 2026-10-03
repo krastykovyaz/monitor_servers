@@ -1,0 +1,10 @@
+/opt/grak_ai/grak_prod.log {
+    weekly
+    maxsize 50M
+    rotate 4
+    compress
+    missingok
+    notifempty
+    copytruncate
+    su grakai grakai
+}
