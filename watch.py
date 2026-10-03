@@ -124,13 +124,16 @@ def load_cfg():
 
 
 def load_expect():
-    """expect.conf: host | proc | pattern,  host | port | number,  host | dir | /path"""
+    """expect.conf: host | proc | pattern [| min count],  host | port | number,  host | dir | /path"""
     exp, path = {}, DIR / "expect.conf"
     if path.exists():
         for line in path.read_text().splitlines():
             p = [x.strip() for x in line.split("#")[0].split("|")]
-            if len(p) == 3 and p[1] in ("proc", "port", "dir") and re.fullmatch(r"[A-Za-z0-9_.@/+ -]+", p[2]):
-                exp.setdefault(p[0], {"proc": [], "port": [], "dir": []})[p[1]].append(p[2])
+            if len(p) in (3, 4) and p[1] in ("proc", "port", "dir") and re.fullmatch(r"[A-Za-z0-9_.@/+ -]+", p[2]):
+                h = exp.setdefault(p[0], {"proc": [], "port": [], "dir": [], "procmin": {}})
+                h[p[1]].append(p[2])
+                if p[1] == "proc" and len(p) == 4 and p[3].isdigit():
+                    h["procmin"][p[2]] = int(p[3])
     return exp
 
 
@@ -433,8 +436,10 @@ class Watch:
         for pat in exp.get("proc", []):
             cnt = d["procs"].get(pat)
             if cnt is not None:
-                self.cond("%s:proc:%s" % (name, pat), cnt == 0, "%s · process %s — not running" % (B, html.escape(pat)),
-                          confirm=2, baseline=baseline, ok="running")
+                need = exp.get("procmin", {}).get(pat, 1)
+                text = ("%s · process %s — not running" % (B, html.escape(pat))) if cnt == 0 else \
+                       ("%s · process %s — %d running, %d expected" % (B, html.escape(pat), cnt, need))
+                self.cond("%s:proc:%s" % (name, pat), cnt < need, text, confirm=2, baseline=baseline, ok="%d running" % cnt)
                 rss = d["procrss"].get(pat)
                 if cnt and rss:
                     self.growth("%s:proc:%s:mem" % (name, pat), "%s · process %s" % (B, html.escape(pat)), rss, ram, baseline)
