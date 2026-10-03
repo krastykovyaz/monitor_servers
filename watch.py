@@ -360,10 +360,11 @@ class Watch:
             Cn = "%s · container %s" % (B, html.escape(cn))
             k = "%s:ctr:%s" % (name, cn)
             st, p = f.get("state", "?"), pcont.get(cn, {})
-            was_running = p.get("state") == "running" or (k + ":state") in s["active"]
-            broken = st in ("restarting", "dead") or (st != "running" and was_running)
-            self.cond(k + ":state", broken, "%s — is %s" % (Cn, st), confirm=1 if st != "restarting" else 2,
-                      baseline=baseline, ok="running", unconfirm=2)
+            # a restart loop is a lasting condition; a container that stops is reported once
+            self.cond(k + ":state", st in ("restarting", "dead"), "%s — is %s" % (Cn, st), confirm=2,
+                      baseline=baseline, ok=st, unconfirm=2)
+            if p.get("state") == "running" and st not in ("running", "restarting", "dead"):
+                self.event(k + ":stopped", "%s — stopped (%s)" % (Cn, st), baseline=baseline, cooldown_h=0)
             m, lim = num(f.get("mem")), num(f.get("limit"))
             if st == "running" and m is not None:
                 if lim:
