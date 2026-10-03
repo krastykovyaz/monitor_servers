@@ -45,6 +45,7 @@ echo "H|cpus=$(nproc)|load1=$(cut -d' ' -f1 /proc/loadavg)|disk_total_kb=$1|disk
 svc() {
   cg=$(systemctl show "$1.service" -p ControlGroup --value 2>/dev/null); an=
   [ -n "$cg" ] && [ -r "/sys/fs/cgroup$cg/memory.stat" ] && an=$(awk '/^(anon|shmem) /{s+=$2} END{print s}' "/sys/fs/cgroup$cg/memory.stat")
+  [ -z "$an" ] && [ -n "$cg" ] && [ -r "/sys/fs/cgroup/memory$cg/memory.stat" ] && an=$(awk '/^total_rss /{print $2}' "/sys/fs/cgroup/memory$cg/memory.stat")
   echo "S|$1|$(systemctl show "$1.service" -p ActiveState,SubState,UnitFileState,MemoryCurrent,NRestarts,Type,WorkingDirectory 2>/dev/null | paste -sd'|' -)|Anon=$an"
 }
 # well-known package services, when installed
@@ -55,9 +56,21 @@ for u in $(systemctl list-units --type=service --all --no-legend --plain 'nginx.
 done
 # listeners reachable from outside (loopback-only ones are ignored)
 echo "L|ports=$( { ss -tlnH 2>/dev/null | awk '{print $4}' | grep -vE '^(127\.|\[::1\])' | sed 's/.*://' | sort -un; ss -ulnH 2>/dev/null | awk '{print $4}' | grep -vE '^(127\.|\[::1\])|%' | sed 's/.*://' | sort -un | awk '$1<32768{print $1"/udp"}'; } | paste -sd, -)"
-for f in /etc/systemd/system/*.service; do
-  [ -f "$f" ] && [ ! -L "$f" ] || continue
-  u=$(basename "$f" .service)
+# Units that are not part of the distribution: regular files or project-linked files in /etc/systemd/system,
+# plus files in /lib/systemd/system that no package owns.
+custom_units() {
+  for f in /etc/systemd/system/*.service; do
+    [ -e "$f" ] || continue
+    if [ -L "$f" ]; then t=$(readlink -f "$f"); case "$t" in /lib/systemd/*|/usr/lib/systemd/*|/etc/systemd/*|/dev/null|/run/*) continue;; esac; fi
+    basename "$f" .service
+  done
+  if command -v dpkg >/dev/null 2>&1; then
+    for u in $(dpkg -S /lib/systemd/system/*.service 2>&1 | sed -n 's#.*no path found matching pattern /lib/systemd/system/\(.*\)\.service.*#\1#p'); do
+      dpkg -S "/usr/lib/systemd/system/$u.service" >/dev/null 2>&1 || echo "$u"
+    done
+  fi
+}
+for u in $(custom_units | sort -u); do
   case "$u" in *@|snap.*|cloud-*|ssh|sshd*|dbus-*|qemu-guest*|do-agent*|droplet-agent*) continue;; esac
   svc "$u"
   if [ "${DU:-0}" = 1 ]; then
@@ -384,14 +397,17 @@ class Watch:
             k = "%s:svc:%s" % (name, u)
             expected = f.get("UnitFileState", "").startswith("enabled") and f.get("Type") != "oneshot"
             st = f.get("ActiveState", "?")
-            self.cond(k + ":state", expected and st != "active",
-                      "%s — service is %s/%s" % (U, st, f.get("SubState", "?")), confirm=2, baseline=baseline, ok="active", unconfirm=2)
+            sb = baseline or u not in pserv
+            # a unit stuck restarting is broken whether or not it is enabled
+            looping = st == "activating" and f.get("SubState") == "auto-restart"
+            self.cond(k + ":state", (expected and st != "active") or looping,
+                      "%s — service is %s/%s" % (U, st, f.get("SubState", "?")), confirm=2, baseline=sb, ok="active", unconfirm=2)
             r, pr = num(f.get("NRestarts")), pserv.get(u, {}).get("restarts")
             if r is not None and pr is not None and r > pr and (k + ":state") not in s["active"]:
-                self.event(k + ":restart", "%s — restarted %d time(s) since the last check, %d total" % (U, r - pr, r), baseline=baseline)
+                self.event(k + ":restart", "%s — restarted %d time(s) since the last check, %d total" % (U, r - pr, r), baseline=sb)
             m = svc_mem(f)
             if m is not None and st == "active":
-                self.growth(k + ":mem", U, m, ram, baseline)
+                self.growth(k + ":mem", U, m, ram, sb)
         self.drop("%s:svc:" % name, set(d["services"]))
 
         # failed units
@@ -570,7 +586,8 @@ def digest(results, state, now, only=None):
             m = svc_mem(f)
             if f.get("ActiveState") == "active" and m is not None:
                 rows.append((m, u, trend("%s:svc:%s:mem" % (name, u), m)))
-            elif f.get("UnitFileState", "").startswith("enabled") and f.get("Type") != "oneshot" and f.get("ActiveState") != "active":
+            elif (f.get("UnitFileState", "").startswith("enabled") and f.get("Type") != "oneshot" and f.get("ActiveState") != "active") \
+                    or (f.get("ActiveState") == "activating" and f.get("SubState") == "auto-restart"):
                 down.append("%s (%s)" % (u, f.get("SubState", f.get("ActiveState", "?"))))
         for cn, f in d["containers"].items():
             if f.get("state") == "running":
