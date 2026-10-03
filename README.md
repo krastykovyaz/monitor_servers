@@ -43,3 +43,10 @@ are listed once as "already abnormal" and stay quiet. Thresholds and mutes live 
 
 The digest also goes out daily at 05:05 from cron. `deploy/vpn_bot_resources_cmd.py` adds a `/resources [host]`
 command to the Telegram bot for the same digest on demand.
+
+### Hosts the central watcher cannot reach
+
+A host can watch itself: copy `watch.py`, `watch.conf`, `expect.conf` and a `.env` with the Telegram settings into
+`~/monitor_servers`, write a `servers.conf` with the single line `NAME | local | -`, and add the same two cron
+entries for that user. aak-first runs this way. `deploy/vscode_server_cleanup.sh` trims `~/.vscode-server`
+weekly on hosts where editor builds pile up.
