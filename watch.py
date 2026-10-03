@@ -54,7 +54,7 @@ for u in $(systemctl list-units --type=service --all --no-legend --plain 'nginx.
   svc "$u"
 done
 # listeners reachable from outside (loopback-only ones are ignored)
-echo "L|ports=$(ss -tlnH 2>/dev/null | awk '{print $4}' | grep -vE '^(127\.|\[::1\])' | sed 's/.*://' | sort -un | paste -sd, -)"
+echo "L|ports=$( { ss -tlnH 2>/dev/null | awk '{print $4}' | grep -vE '^(127\.|\[::1\])' | sed 's/.*://' | sort -un; ss -ulnH 2>/dev/null | awk '{print $4}' | grep -vE '^(127\.|\[::1\])|%' | sed 's/.*://' | sort -un | awk '$1<32768{print $1"/udp"}'; } | paste -sd, -)"
 for f in /etc/systemd/system/*.service; do
   [ -f "$f" ] && [ ! -L "$f" ] || continue
   u=$(basename "$f" .service)
@@ -446,7 +446,7 @@ def show(results, only=None):
         if d["failed"]:
             print("  failed units: " + ", ".join(d["failed"]))
         if d["ports"]:
-            print("  listening: " + ", ".join(sorted(d["ports"], key=int)))
+            print("  listening: " + ", ".join(sorted(d["ports"], key=lambda x: (int(x.split("/")[0]), x))))
 
 
 def digest(results, state, now, only=None):
@@ -504,7 +504,7 @@ def digest(results, state, now, only=None):
             if extra_failed:
                 out.append("⛔ failed units: " + html.escape(", ".join(extra_failed)))
         if d["ports"]:
-            out.append("ports: " + ", ".join(sorted(d["ports"], key=int)))
+            out.append("ports: " + ", ".join(sorted(d["ports"], key=lambda x: (int(x.split("/")[0]), x))))
         fresh = [a["text"] for k, a in active.items() if k.startswith(name + ":") and not a.get("known")]
         for t in fresh:
             out.append("🚨 " + t)
