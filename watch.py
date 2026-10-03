@@ -630,6 +630,24 @@ def digest(results, state, now, only=None):
     return "\n".join(out)
 
 
+def heartbeat(env, servers):
+    """Tell the heartbeat receiver this watcher is alive (HB_URL in .env). Silence there raises an alert."""
+    url = env.get("HB_URL")
+    if not url:
+        return
+    if env.get("HB_NAME"):
+        name = env["HB_NAME"]
+    elif len(servers) == 1 and servers[0][1] == "local":
+        name = servers[0][0]
+    else:
+        import socket
+        name = socket.gethostname().split(".")[0] + "-central"
+    try:
+        urllib.request.urlopen(url.rstrip("/") + "/" + urllib.parse.quote(name), timeout=10).read()
+    except Exception:
+        pass
+
+
 def send(env, text):
     chunks, cur = [], ""
     for line in text.split("\n"):
@@ -702,6 +720,7 @@ def main():
     tmp = STATE_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(state))
     os.replace(str(tmp), str(STATE_FILE))
+    heartbeat(env, servers)
     if msg:
         send(env, msg)
     print("%s reachable=%d fired=%d resolved=%d active=%d" % (

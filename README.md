@@ -50,3 +50,18 @@ A host can watch itself: copy `watch.py`, `watch.conf`, `expect.conf` and a `.en
 `~/monitor_servers`, write a `servers.conf` with the single line `NAME | local | -`, and add the same two cron
 entries for that user. aak-first runs this way. `deploy/vscode_server_cleanup.sh` trims `~/.vscode-server`
 weekly on hosts where editor builds pile up.
+
+## External checks (`probe.py`)
+
+Checks every target in `probes.conf` over the internet every 5 minutes: HTTP status, TLS certificate validity
+and days to expiry, or a plain TCP connect. Alerts after two consecutive failures, on recovery, and when a
+certificate has under 14 days left. Targets that resolve to the prober's own address are skipped, so a second
+prober on another server covers them: horek_ge probes everything else, horek_fi probes horek_ge
+(`probe.py --only-ip 2.26.22.251`).
+
+## Heartbeats (`heartbeat_server.py`)
+
+A small receiver on horek_ge (systemd unit `monitor-heartbeat`, port 8787). Every watcher calls it after each
+run (`HB_URL` in its `.env`). A name that stays silent for 25 minutes raises an alert, and another when it
+returns. This catches what a self-watching host cannot report: its own death, or its whole network going down.
+`/status/<secret>` shows all names; `/forget/<secret>/<name>` retires one.
