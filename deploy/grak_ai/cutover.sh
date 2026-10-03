@@ -28,6 +28,7 @@ if [ "$MODE" = --stop-test ]; then
 fi
 
 echo "3. copy session, content database and shared dedup registry (tar stream, checksum verified)"
+ssh -n $S $LAB "cd $D && python3 -c "import sqlite3; c = sqlite3.connect('content_database.db'); print('   checkpoint:', c.execute('pragma wal_checkpoint(TRUNCATE)').fetchone()); c.close()""
 FILES=$(ssh -n $S $LAB "cd $D && ls session2.session content_database.db content_database.db-wal content_database.db-shm 2>/dev/null | paste -sd' ' -" || true)
 ssh -n $S $LAB "cd $D && sha256sum $FILES" > "$SUMS"
 ssh -n $S $LAB "tar -C $D -cf - $FILES" | ssh $S $SRV "tar -C /opt/grak_ai --no-same-owner -xf -"

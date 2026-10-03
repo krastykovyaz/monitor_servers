@@ -5,6 +5,8 @@ LAB=aak-third; SRV=root@2.26.22.251; D=/home/alex/projects/grak_ai
 S="-o IPQoS=none -o BatchMode=yes -o ConnectTimeout=25"
 SUMS=$(mktemp); trap 'rm -f "$SUMS"' EXIT
 ssh -n $S $SRV 'systemctl disable --now grak-ai 2>/dev/null || true; echo "horek_ge: $(systemctl is-active grak-ai || true)"'
+# Fold SQLite's journal into the main file first, or the last writes stay behind in content_database.db-wal.
+ssh -n $S $SRV "cd /opt/grak_ai && runuser -u grakai -- python3 -c "import sqlite3; c = sqlite3.connect('content_database.db'); print('   checkpoint:', c.execute('pragma wal_checkpoint(TRUNCATE)').fetchone()); c.close()" && rm -f content_database.db-wal content_database.db-shm"
 ssh -n $S $SRV "cd /opt/grak_ai && sha256sum session2.session content_database.db" > "$SUMS"
 ssh -n $S $SRV "tar -C /opt/grak_ai -cf - session2.session content_database.db" | ssh $S $LAB "tar -C $D -xf -"
 ssh $S $LAB "cd $D && sha256sum -c --quiet" < "$SUMS"
