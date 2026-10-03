@@ -55,7 +55,7 @@ for u in $(systemctl list-units --type=service --all --no-legend --plain 'nginx.
   svc "$u"
 done
 # listeners reachable from outside (loopback-only ones are ignored)
-echo "L|ports=$( { ss -tlnH 2>/dev/null | awk '{print $4}' | grep -vE '^(127\.|\[::1\])' | sed 's/.*://' | sort -un; ss -ulnH 2>/dev/null | awk '{print $4}' | grep -vE '^(127\.|\[::1\])|%' | sed 's/.*://' | sort -un | awk '$1<32768{print $1"/udp"}'; } | paste -sd, -)"
+echo "L|ports=$( { ss -tln 2>/dev/null | awk 'NR>1{print $4}' | grep -vE '^(127\.|\[::1\])' | sed 's/.*://' | sort -un; ss -uln 2>/dev/null | awk 'NR>1{print $4}' | grep -vE '^(127\.|\[::1\])|%' | sed 's/.*://' | sort -un | awk '$1<32768{print $1"/udp"}'; } | paste -sd, -)"
 # Units that are not part of the distribution: regular files or project-linked files in /etc/systemd/system,
 # plus files in /lib/systemd/system that no package owns.
 custom_units() {
@@ -101,7 +101,7 @@ done
 # folders declared in expect.conf (daily)
 if [ "${DU:-0}" = 1 ]; then for dir in ${EXPECT_DIRS:-}; do [ -d "$dir" ] && echo "D|$dir|kb=$(timeout 120 du -sxk "$dir" 2>/dev/null | cut -f1)"; done; fi
 IFS=$OLDIFS
-echo "LA|ports=$(ss -tlnH 2>/dev/null | awk '{print $4}' | sed 's/.*://' | sort -un | paste -sd, -)"
+echo "LA|ports=$(ss -tln 2>/dev/null | awk 'NR>1{print $4}' | sed 's/.*://' | sort -un | paste -sd, -)"
 # apps run by PM2 (not systemd-managed)
 if command -v pm2 >/dev/null 2>&1 && pgrep -f "PM2 v" >/dev/null 2>&1; then
   pm2 jlist 2>/dev/null | python3 -c 'import sys, json
@@ -229,7 +229,8 @@ def collect(server, env, with_du, expect=None):
     if target == "local":      # watch the machine this runs on, no SSH
         cmd = ["env", "DU=%d" % (1 if with_du else 0), "bash", "-s"]
     try:
-        r = subprocess.run(cmd, input=script, capture_output=True, text=True, timeout=300 if with_du else 90)
+        r = subprocess.run(cmd, input=script, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           universal_newlines=True, timeout=300 if with_du else 90)
         return name, parse(r.stdout)
     except Exception:
         return name, None
@@ -700,7 +701,7 @@ def main():
     STATE_FILE.parent.mkdir(exist_ok=True)
     tmp = STATE_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(state))
-    os.replace(tmp, STATE_FILE)
+    os.replace(str(tmp), str(STATE_FILE))
     if msg:
         send(env, msg)
     print("%s reachable=%d fired=%d resolved=%d active=%d" % (
