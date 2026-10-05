@@ -1,0 +1,87 @@
+#!/bin/bash
+# horek_fi: /usr/local/sbin/arxiv-failover, run every minute by arxiv-failover.timer.
+# Starts the arxiv bots here when the lab stops renewing its lease, and keeps them running while horek_fi owns them.
+#
+# Safety rules, so the lab and horek_fi never run the bots at the same time:
+#  - the lab guard stops its own copies after 5 minutes without a renewal;
+#  - this host takes over only after the lease is 10 minutes old on 3 consecutive checks, aak-second's
+#    monitoring heartbeat has been silent for 20 minutes, this host has internet and has been up 15 minutes;
+#  - ownership is recorded before the bots start, so a late renewal from the lab is told to stand down;
+#  - a snapshot that fails SQLite's integrity check is never installed.
+set -u
+D=/var/lib/arxiv-failover; APP=/opt/arxiv_bot; SVCS="arxiv arxiv_bot"
+LEASE_MAX=600; CHECKS=3; MIN_UPTIME=900
+HB_NAME=aak-second
+HB_MAX=1200     # aak-second reports every 10 minutes; 20 minutes of silence means the host is down or cut off
+mkdir -p "$D/standby"; chmod 700 "$D"
+[ -f "$D/owner" ] || echo lab > "$D/owner"
+owner=$(cat "$D/owner")
+log() { echo "$(date '+%F %T') $*" >> "$D/failover.log"; }
+. /etc/arxiv-failover.env
+alert() {
+  printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$TG_BOT_TOKEN" |
+    curl -s -m 15 -o /dev/null -K - --data-urlencode "chat_id=$TG_CHAT_ID" --data-urlencode "text=$1" || true
+}
+running() { local s; for s in $SVCS; do systemctl is-active --quiet "$s" && return 0; done; return 1; }
+
+if [ "$owner" = horek_fi ]; then
+  for s in $SVCS; do
+    if ! systemctl is-active --quiet "$s"; then
+      systemctl reset-failed "$s" 2>/dev/null; systemctl start "$s"
+      log "owner is horek_fi and $s was not running; started it"
+    fi
+  done
+  exit 0
+fi
+
+# The lab owns the bots: they must never run here.
+if running; then
+  systemctl stop $SVCS; log "owner is lab but the bots were running here; stopped them"
+  alert "⚠️ arxiv: found running on horek_fi while the lab owns it. Stopped them on horek_fi."
+fi
+
+age=$(( $(date +%s) - $(stat -c %Y "$D/lease" 2>/dev/null || echo 0) ))
+if [ "$age" -le "$LEASE_MAX" ]; then echo 0 > "$D/expired_count"; exit 0; fi
+
+up=$(cut -d. -f1 /proc/uptime)
+if [ "$up" -lt "$MIN_UPTIME" ] || ! curl -s -m 10 -o /dev/null https://api.telegram.org/; then
+  echo 0 > "$D/expired_count"; log "lease is $age s old but this host is not ready (uptime $up s or no internet)"; exit 0
+fi
+n=$(( $(cat "$D/expired_count" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$D/expired_count"
+if [ "$n" -lt "$CHECKS" ]; then log "lease is $age s old, check $n of $CHECKS"; exit 0; fi
+
+# Second witness: aak-second's monitoring heartbeat comes from a separate job. If it is still fresh, the lab
+# host is alive and only the guard is broken, so its bots may still be running: hold and alert, never start a second copy.
+hb_age=$(curl -s -m 8 "$HB_STATUS_URL" |
+  python3 -c "import sys, json; print(json.load(sys.stdin).get('$HB_NAME', {}).get('age_s', 999999))" 2>/dev/null || echo 999999)
+if [ "$hb_age" -lt "$HB_MAX" ]; then
+  log "lease is $age s old but $HB_NAME's monitoring heartbeat is $hb_age s old; the lab is alive, not taking over"
+  [ "$n" -eq "$CHECKS" ] && alert "⚠️ arxiv: the lab stopped renewing its lease, but aak-second itself is alive. Not taking over, to avoid two copies. Check /var/lib/arxiv-guard/guard.log on aak-second."
+  exit 0
+fi
+
+if [ ! -s "$D/standby/papers.db" ] || [ ! -s "$D/standby/bot.session" ]; then
+  log "lease expired but there is no standby snapshot; cannot take over"
+  [ "$n" -eq "$CHECKS" ] && alert "❌ arxiv: the lab is silent but horek_fi has no state snapshot, so it cannot take over."
+  exit 1
+fi
+chk=$(python3 - "$D/standby/papers.db" <<'PY' 2>&1
+import sqlite3, sys
+c = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True)
+print(c.execute("pragma quick_check").fetchone()[0])
+PY
+)
+if [ "$chk" != ok ]; then
+  log "standby papers.db failed the integrity check: $chk"
+  [ "$n" -eq "$CHECKS" ] && alert "❌ arxiv: the lab is silent but the snapshot on horek_fi failed its integrity check, so it cannot take over."
+  exit 1
+fi
+
+echo horek_fi > "$D/owner"
+snap=$(( ($(date +%s) - $(stat -c %Y "$D/standby/papers.db")) / 60 ))
+install -o arxiv -g arxiv -m 640 "$D/standby/papers.db" "$APP/papers.db"
+install -o arxiv -g arxiv -m 600 "$D/standby/bot.session" "$APP/bot.session"
+rm -f "$APP/papers.db-wal" "$APP/papers.db-shm"
+for s in $SVCS; do systemctl reset-failed "$s" 2>/dev/null; systemctl start "$s"; done
+log "TAKEOVER: lease $age s old; started $SVCS with a $snap min old snapshot"
+alert "🔁 arxiv failover: the lab has not checked in for $(( age / 60 )) min. Started arxiv and arxiv_bot on horek_fi with state from $snap min ago (a paper posted in that window may be posted again). Switch back with deploy/arxiv/failover/failback.sh"

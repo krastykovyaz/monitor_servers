@@ -1,0 +1,6 @@
+[Unit]
+Description=arxiv failover check (start the bots here if the lab stops renewing its lease)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/arxiv-failover

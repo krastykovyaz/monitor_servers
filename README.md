@@ -86,3 +86,22 @@ the lab goes silent, and never while the lab copy may still be running.
 
 Known limit: if the cron daemon on aak-third stops while the VM and the bot keep running, both the lease and
 the heartbeat stop, and horek_ge would start a second copy.
+
+## arxiv failover (`deploy/arxiv/failover/`)
+
+The arxiv bots (`arxiv.service` posts papers, `arxiv_bot.service` answers questions) run in the lab on aak-second
+as root systemd units. horek_fi (`/opt/arxiv_bot`, user `arxiv`, units in `deploy/arxiv/`) holds a standby copy that
+starts automatically if the lab goes silent. It uses the same lease design as grak_ai, with these differences:
+
+- The lab guard (`arxiv_guard.sh`) runs as **root** from `/etc/cron.d/arxiv-guard`, because it has to stop and
+  start the root services. It is installed once with `sudo bash ~/.local/share/arxiv_guard/stage/install_lab.sh`.
+  It restarts the bots only after it stopped them itself, or when `failback.sh` asks for it (`start_requested`).
+- The 520 MB `papers.db` and `bot.session` are copied every 15 minutes: SQLite online backup into `/dev/shm`
+  (about 2 s, no disk wear), then `rsync` delta upload. horek_fi checks the snapshot with `pragma quick_check`
+  before it installs it. A paper posted in the last 15 minutes before a failover may be posted again.
+- The witness is aak-second's monitoring heartbeat, read from the public receiver; it reports every 10 minutes,
+  so takeover needs 20 minutes of silence on top of the 10 minute lease.
+- After a reboot of the lab, `arxiv-guard-precheck` (an `ExecStartPre` drop-in) refuses to start the bots while
+  horek_fi owns them.
+- Switching back: `bash deploy/arxiv/failover/failback.sh`. Hold the guard: `touch ~/.local/share/arxiv_guard/paused`.
+- State: `/var/lib/arxiv-failover/{owner,lease,standby/,failover.log}` on horek_fi, `/var/lib/arxiv-guard/` on aak-second.

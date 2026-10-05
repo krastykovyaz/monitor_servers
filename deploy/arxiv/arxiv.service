@@ -1,0 +1,21 @@
+[Unit]
+Description=arxiv - posts research papers to the Telegram groups
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=arxiv
+Group=arxiv
+WorkingDirectory=/opt/arxiv_bot
+ExecStart=/opt/arxiv_bot/venv/bin/python -u main.py
+Restart=on-failure
+RestartSec=30
+MemoryMax=700M
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/arxiv_bot
+
+[Install]
+WantedBy=multi-user.target
