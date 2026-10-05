@@ -67,7 +67,7 @@ if [ ! -s "$D/standby/papers.db" ] || [ ! -s "$D/standby/bot.session" ]; then
 fi
 chk=$(python3 - "$D/standby/papers.db" <<'PY' 2>&1
 import sqlite3, sys
-c = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True)
+c = sqlite3.connect("file:%s?mode=ro&immutable=1" % sys.argv[1], uri=True)
 print(c.execute("pragma quick_check").fetchone()[0])
 PY
 )
