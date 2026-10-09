@@ -14,6 +14,7 @@ LEASE_MAX=600; CHECKS=3; MIN_UPTIME=900
 HB_NAME=aak-second
 HB_MAX=1200     # aak-second reports every 10 minutes; 20 minutes of silence means the host is down or cut off
 mkdir -p "$D/standby"; chmod 700 "$D"
+exec 9>"$D/lock"; flock -n 9 || exit 0
 [ -f "$D/owner" ] || echo lab > "$D/owner"
 owner=$(cat "$D/owner")
 log() { echo "$(date '+%F %T') $*" >> "$D/failover.log"; }
@@ -25,6 +26,7 @@ alert() {
 running() { local s; for s in $SVCS; do systemctl is-active --quiet "$s" && return 0; done; return 1; }
 
 if [ "$owner" = horek_fi ]; then
+  [ -f "$D/hold" ] && exit 0      # failback.sh is moving the data back; do not restart the bots meanwhile
   for s in $SVCS; do
     if ! systemctl is-active --quiet "$s"; then
       systemctl reset-failed "$s" 2>/dev/null; systemctl start "$s"
@@ -53,8 +55,16 @@ if [ "$n" -lt "$CHECKS" ]; then log "lease is $age s old, check $n of $CHECKS"; 
 # Second witness: aak-second's monitoring heartbeat comes from a separate job. If it is still fresh, the lab
 # host is alive and only the guard is broken, so its bots may still be running: hold and alert, never start a second copy.
 hb_age=$(curl -s -m 8 "$HB_STATUS_URL" |
-  python3 -c "import sys, json; print(json.load(sys.stdin).get('$HB_NAME', {}).get('age_s', 999999))" 2>/dev/null || echo 999999)
-if [ "$hb_age" -lt "$HB_MAX" ]; then
+  python3 -c "import sys, json; print(json.load(sys.stdin).get('$HB_NAME', {}).get('age_s', 999999))" 2>/dev/null)
+case "$hb_age" in ''|*[!0-9]*) hb_age=unknown ;; esac
+if [ "$hb_age" = unknown ]; then
+  # Cannot tell whether the lab is alive. A starved or cut-off horek_fi must not guess "dead": hold for an hour.
+  if [ "$age" -lt 3600 ]; then
+    log "lease is $age s old but the heartbeat witness could not be read; holding (takes over only after 3600 s)"
+    [ "$n" -eq "$CHECKS" ] && alert "⚠️ arxiv: the lab lease is $(( age / 60 )) min old and horek_fi cannot read the heartbeat witness. Holding; it takes over only if this lasts an hour."
+    exit 0
+  fi
+elif [ "$hb_age" -lt "$HB_MAX" ]; then
   log "lease is $age s old but $HB_NAME's monitoring heartbeat is $hb_age s old; the lab is alive, not taking over"
   [ "$n" -eq "$CHECKS" ] && alert "⚠️ arxiv: the lab stopped renewing its lease, but aak-second itself is alive. Not taking over, to avoid two copies. Check /var/lib/arxiv-guard/guard.log on aak-second."
   exit 0
@@ -65,7 +75,7 @@ if [ ! -s "$D/standby/papers.db" ] || [ ! -s "$D/standby/bot.session" ]; then
   [ "$n" -eq "$CHECKS" ] && alert "❌ arxiv: the lab is silent but horek_fi has no state snapshot, so it cannot take over."
   exit 1
 fi
-chk=$(python3 - "$D/standby/papers.db" <<'PY' 2>&1
+chk=$(timeout 120 python3 - "$D/standby/papers.db" <<'PY' 2>&1
 import sqlite3, sys
 c = sqlite3.connect("file:%s?mode=ro&immutable=1" % sys.argv[1], uri=True)
 print(c.execute("pragma quick_check").fetchone()[0])
@@ -77,6 +87,10 @@ if [ "$chk" != ok ]; then
   exit 1
 fi
 
+age2=$(( $(date +%s) - $(stat -c %Y "$D/lease" 2>/dev/null || echo 0) ))
+if [ "$age2" -le "$LEASE_MAX" ]; then
+  log "the lease was renewed while the checks ran ($age2 s old now); not taking over"; echo 0 > "$D/expired_count"; exit 0
+fi
 echo horek_fi > "$D/owner"
 snap=$(( ($(date +%s) - $(stat -c %Y "$D/standby/papers.db")) / 60 ))
 install -o arxiv -g arxiv -m 640 "$D/standby/papers.db" "$APP/papers.db"

@@ -6,10 +6,12 @@
 set -eu -o pipefail
 LAB=aak-second; SRV=root@2.27.33.175; D=/home/alex/projects/arxiv_bot
 S="-o IPQoS=none -o BatchMode=yes -o ConnectTimeout=25"
-SUMS=$(mktemp); trap 'rm -f "$SUMS"' EXIT
+SUMS=$(mktemp)
+trap 'rm -f "$SUMS"; ssh -n $S $SRV "rm -f /var/lib/arxiv-failover/hold" || true' EXIT
 [ "$(ssh -n $S $SRV 'cat /var/lib/arxiv-failover/owner')" = horek_fi ] || { echo "the lab already owns the arxiv bots"; exit 0; }
 [ "$(ssh -n $S $LAB 'systemctl is-active arxiv arxiv_bot | grep -c "^active"' || true)" = 0 ] || { echo "the lab bots are still running; stop them first (sudo systemctl stop arxiv arxiv_bot on aak-second)"; exit 1; }
 ssh -n $S $LAB 'mkdir -p ~/.local/share/arxiv_guard && touch ~/.local/share/arxiv_guard/paused'
+ssh -n $S $SRV 'touch /var/lib/arxiv-failover/hold'   # the watchdog must not restart the bots while data moves
 ssh -n $S $SRV 'systemctl stop arxiv arxiv_bot; echo "horek_fi: arxiv=$(systemctl is-active arxiv || true) arxiv_bot=$(systemctl is-active arxiv_bot || true)"'
 ssh $S $SRV "cd /opt/arxiv_bot && runuser -u arxiv -- python3 -" <<'PY'
 import sqlite3
