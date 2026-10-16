@@ -42,6 +42,14 @@ if running; then
   alert "⚠️ arxiv: found running on horek_fi while the lab owns it. Stopped them on horek_fi."
 fi
 
+# An upload that died halfway (host frozen, connection cut) leaves a hidden rsync temp file of the full database
+# size. Remove such files once they are 2 hours old and no upload is running.
+if ! pgrep -f "rsync --server|rrsync" >/dev/null; then
+  for f in "$D"/standby/.papers.db.* "$D"/standby/.bot.session.*; do
+    if [ -e "$f" ] && [ -n "$(find "$f" -mmin +120 2>/dev/null)" ]; then rm -f "$f"; log "removed stale upload temp file $(basename "$f")"; fi
+  done
+fi
+
 age=$(( $(date +%s) - $(stat -c %Y "$D/lease" 2>/dev/null || echo 0) ))
 if [ "$age" -le "$LEASE_MAX" ]; then echo 0 > "$D/expired_count"; exit 0; fi
 
