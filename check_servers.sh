@@ -27,9 +27,10 @@ probe() {  # name target port
     local warn=""
     [ "${disk%\%}" -ge 85 ] 2>/dev/null && warn="$warn ⚠️disk"
     [ "${mem%\%}" -ge 85 ] 2>/dev/null && warn="$warn ⚠️ram"
-    local l1=${load%% *}; awk -v l="$l1" -v c="$cpus" 'BEGIN{exit !(l>c)}' && warn="$warn ⚠️load"
-    printf '✅ <b>%s</b>%s\n   up %s · load %s/%s cpu · ram %s · disk %s · docker %s\n' \
-      "$name" "$warn" "$up" "$l1" "$cpus" "$mem" "$disk" "$dock"
+    # Warn on the 15-minute average: the 1-minute figure at 05:00 always catches the monitor's own burst of checks.
+    local l1=${load%% *} l15=${load##* }; awk -v l="$l15" -v c="$cpus" 'BEGIN{exit !(l>c)}' && warn="$warn ⚠️load"
+    printf '✅ <b>%s</b>%s\n   up %s · load %s (15m %s)/%s cpu · ram %s · disk %s · docker %s\n' \
+      "$name" "$warn" "$up" "$l1" "$l15" "$cpus" "$mem" "$disk" "$dock"
   else
     local err; err=$(echo "$out" | grep -v '^$' | tail -1 | sed 's/^ssh: //; s/.*Permission denied.*/Permission denied (key not accepted)/; s/.*timed out.*/timed out/; s/.*Could not resolve.*/DNS failed/; s/.*Broken pipe.*/session dropped/' | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g' | cut -c1-120)
     printf '❌ <b>%s</b> — %s\n' "$name" "${err:-no response}"

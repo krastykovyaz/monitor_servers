@@ -24,6 +24,8 @@ and every Docker container (state, RAM, memory limit, OOM kills, restarts). It k
 - an enabled service stops being active, restarts, or a unit enters failed state
 - root disk passes 85% or 93%, or grows more than 3 GB in a day; a service folder grows 30% and 300 MB in a day
 - available RAM drops under 8%, swap passes 90%, load stays above 2x the CPU count
+
+The daily status (`check_servers.sh`) flags `⚠️load` when the 15-minute load average is above the CPU count, and shows the 1-minute and 15-minute values.
 - a host becomes unreachable or reboots
 - a port that was steadily listening on a public interface stops listening
 
