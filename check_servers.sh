@@ -82,7 +82,7 @@ PY2
 )
     if [ -n "$n" ]; then ol="$ol✅ $ep · $n models"$'\n'; else ol="$ol❌ $ep · no answer"$'\n'; fi
   done < "$DIR/ollama.conf"
-  body="$body"$'\n'"🧠 <b>Ollama API</b>"$'\n'"$ol"
+  [ -n "$ol" ] && body="$body"$'\n'"🧠 <b>Ollama API</b>"$'\n'"$ol"
 fi
 msg="🖥 <b>Server status</b> $(date '+%Y-%m-%d %H:%M')  —  ${ok} up, ${bad} down"$'\n\n'"$body"
 
