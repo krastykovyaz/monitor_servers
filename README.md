@@ -107,3 +107,11 @@ starts automatically if the lab goes silent. It uses the same lease design as gr
   horek_fi owns them.
 - Switching back: `bash deploy/arxiv/failover/failback.sh`. Hold the guard: `touch ~/.local/share/arxiv_guard/paused`.
 - State: `/var/lib/arxiv-failover/{owner,lease,standby/,failover.log}` on horek_fi, `/var/lib/arxiv-guard/` on aak-second.
+
+## Reaching the Pi (`deploy/pi/pi-tunnel.service`)
+
+The Pi sits behind the university network, which resets connections to Tailscale's servers (since 2026-10-22), and its
+cable address changes with DHCP. It therefore dials out to horek_ge over SSH (port 22 is open) and keeps a reverse tunnel
+on horek_ge's loopback port 2201. The tunnel account `pitunnel` has no shell and its key may only listen on that port.
+Connect with `ssh -J root@2.26.22.251 -p 2201 -o HostKeyAlias=pi-tunnel root@127.0.0.1`. The Pi also runs its own Wi-Fi
+(`Dobrolet`, 192.168.50.1), reachable from any device on that Wi-Fi.

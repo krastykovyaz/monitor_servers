@@ -1,0 +1,19 @@
+# Pi (DietPi): /etc/systemd/system/pi-tunnel.service
+# Reverse SSH tunnel to horek_ge, for when Tailscale is blocked by the university network.
+# horek_ge side: user "pitunnel" (no shell, no password) whose authorized_keys line is
+#   restrict,port-forwarding,permitlisten="127.0.0.1:2201" ssh-ed25519 ... pi-tunnel@dietpi
+# plus /etc/ssh/sshd_config.d/pitunnel.conf (ClientAliveInterval 30 / CountMax 3 for that user, so a dead tunnel frees port 2201).
+# The target is the Pi's Wi-Fi address because Dropbear listens only on 192.168.50.1 and the Tailscale address, not on 127.0.0.1.
+# Reach the Pi from the Mac:  ssh -J root@2.26.22.251 -p 2201 -o HostKeyAlias=pi-tunnel root@127.0.0.1
+[Unit]
+Description=Reverse SSH tunnel from the Pi to horek_ge (reach the Pi when Tailscale is blocked)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/ssh -N -T -i /root/.ssh/id_ed25519_pitunnel -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o ConnectTimeout=20 -R 127.0.0.1:2201:192.168.50.1:22 pitunnel@2.26.22.251
+Restart=always
+RestartSec=20
+
+[Install]
+WantedBy=multi-user.target
