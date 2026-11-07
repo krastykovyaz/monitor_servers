@@ -1,7 +1,8 @@
 #!/bin/bash
 # aak-second: /usr/local/sbin/arxiv-guard, run every minute from /etc/cron.d/arxiv-guard as root.
 # Renews the lab's lease on horek_fi, pushes a state snapshot every 15 minutes, and stops the lab bots when
-# it can no longer prove it is the owner (restarting them once ownership is confirmed again).
+# it can no longer prove it is the owner (restarting them once ownership is confirmed again). The snapshot
+# upload runs in the background so it never delays a renewal.
 #
 # The guard restarts the bots only after it stopped them itself (fenced) or after failback.sh asked for it
 # (start_requested). Maintenance: touch /home/alex/.local/share/arxiv_guard/paused to hold both.
@@ -32,12 +33,18 @@ case "$r" in
       alert "▶️ arxiv: the lab's lease on horek_fi is confirmed again, the guard started the bots here."
     fi
     if [ $(( $(date +%s) - $(stat -c %Y "$ST/last_push" 2>/dev/null || echo 0) )) -ge "$PUSH_EVERY" ]; then
-      mkdir -p "$SNAP"; chmod 700 "$SNAP"
-      if python3 /usr/local/sbin/arxiv-snapshot "$D" "$SNAP" && \
-         timeout 900 rsync -a -e "ssh $S" "$SNAP/" "$SRV:./" 2>>"$ST/guard.log"; then
-        touch "$ST/last_push"
-      else log "snapshot push failed"; fi
-      rm -rf "$SNAP"
+      # The upload can take minutes on a slow link. It runs in the background under its own lock, so the next
+      # runs keep renewing the lease meanwhile (an upload holding the renewal lock caused the Oct 9 false takeover).
+      (
+        exec 9>&-                                   # must not inherit the renewal lock
+        exec 8>"$ST/push.lock"; flock -n 8 || exit 0
+        mkdir -p "$SNAP"; chmod 700 "$SNAP"
+        if python3 /usr/local/sbin/arxiv-snapshot "$D" "$SNAP" && \
+           timeout 900 rsync -a --timeout=120 -e "ssh $S" "$SNAP/" "$SRV:./" 2>>"$ST/guard.log"; then
+          touch "$ST/last_push"
+        else log "snapshot push failed"; fi
+        rm -rf "$SNAP"
+      ) </dev/null >/dev/null 2>&1 &
     fi ;;
   owner=horek_fi*)
     if running; then
