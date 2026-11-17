@@ -15,7 +15,7 @@ import urllib.parse, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from common import dur, hb_ping, load_kv, tg_send
+from common import dur, hb_ping, load_kv, log_sent, tg_send
 
 DIR = Path(__file__).resolve().parent
 STATE_FILE = DIR / "state" / "watch_state.json"
@@ -634,6 +634,7 @@ def heartbeat(env, servers):
 
 def send(env, text):
     tg_send(env, text)
+    log_sent("watch", text)
 
 
 def main():

@@ -1,5 +1,7 @@
 """Helpers shared by watch.py and probe.py. Standard library only, runs on Python 3.5+."""
+import os
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -73,3 +75,14 @@ def hb_ping(env, name, max_silence=None):
         return True
     except Exception:
         return False
+
+
+def log_sent(source, text):
+    """Appends a plain-text copy of a delivered message to logs/alerts.log, so alert noise can be analysed later."""
+    plain = re.sub(r"<[^>]+>", "", text).replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "alerts.log")
+    try:
+        with open(path, "a") as f:
+            f.write("%s %s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), source, plain.replace("\n", " | ")))
+    except OSError:
+        pass
