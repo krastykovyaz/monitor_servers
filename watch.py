@@ -123,6 +123,10 @@ def load_cfg():
     for k, v in load_kv(DIR / "watch.conf").items():
         if k in cfg:
             cfg[k] = v if k == "MUTE" else float(v)
+        elif "@" in k and k.split("@", 1)[0] in cfg and k.split("@", 1)[0] != "MUTE":
+            # per-server override, e.g. LOAD_FACTOR@horek_ge2=4
+            key, host = k.split("@", 1)
+            cfg.setdefault("_host", {}).setdefault(host, {})[key] = float(v)
     return cfg
 
 
@@ -336,7 +340,7 @@ class Watch:
                 self.fired.append("<b>%s</b> unreachable — no SSH answer for %d checks" % (name, n))
 
     def host(self, name, d):
-        c, s = self.cfg, self.s
+        c, s = dict(self.cfg, **self.cfg.get("_host", {}).get(name, {})), self.s
         baseline = name not in s["seen"]
         prev = s["prev"].get(name, {})
         B = "<b>%s</b>" % html.escape(name)

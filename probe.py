@@ -23,7 +23,7 @@ from common import dur, hb_ping, load_kv, log_sent, tg_send
 DIR = Path(__file__).resolve().parent
 STATE_FILE = DIR / "state" / "probe_state.json"
 TIMEOUT = 15
-CONFIRM = 2            # consecutive failures before alerting
+CONFIRM = 3            # consecutive failures before alerting (15 min: 10 min blips of sub.vpn were noise)
 CERT_WARN_DAYS = 14
 CERT_REPEAT_H = 72
 
