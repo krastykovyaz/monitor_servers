@@ -117,6 +117,55 @@ class AlertLogic(unittest.TestCase):
             self.assertIn(old, good)
             run_checks([good.replace(old, new)] * 2)
 
+    def test_pm2_app_with_a_colon_in_its_name_alerts(self):
+        """A pm2 app called api:worker that stays errored must alert.
+        Defect: drop() cut the key at the first ':', treated 'api' as an unknown item and erased its failure counter
+        on every run, so the alert never confirmed."""
+        base = host_output()
+        pm2 = lambda status: base.replace("L|ports=22", "M|api:worker|status=%s|restarts=0|mem=1000\nL|ports=22" % status, 1)
+        state, log = run_checks([pm2("online"), pm2("errored"), pm2("errored"), pm2("errored")])
+        fired = [t for f, r in log for t in f]
+        self.assertTrue(any("api:worker" in t and "errored" in t for t in fired), "no alert for the errored app: %s" % fired)
+
+    def test_ram_share_alert_does_not_flap_at_the_threshold(self):
+        """A service hovering around 35% of host RAM must not alert, resolve and alert again.
+        Defect: the ':max' condition cleared on the first reading under the line."""
+        base = host_output()
+
+        def with_service(pct):
+            m = 4000000 * 1024 * pct // 100
+            line = ("S|big|ActiveState=active|SubState=running|UnitFileState=enabled|MemoryCurrent=%d|NRestarts=0"
+                    "|Type=simple|Anon=%d\nL|ports=22" % (m, m))
+            return base.replace("L|ports=22", line, 1)
+
+        state, log = run_checks([with_service(p) for p in [30, 36, 36, 34, 36, 36, 34, 36, 36]])
+        fired = sum(1 for f, r in log for t in f if "of the host" in t)
+        self.assertEqual(fired, 1, "RAM-share alert fired %d times in 90 minutes" % fired)
+
+    def test_removed_host_is_forgotten_after_three_runs(self):
+        """A host removed from servers.conf must not keep alerts and history in the state forever.
+        Defect: nothing ever cleaned them (the stale DigitalOcean alerts)."""
+        def holds(state, host):
+            return any(k.split(":", 1)[0] == host for b in ("active", "pending", "cooldown", "hist") for k in state[b]) \
+                or any(host in state[b] for b in ("seen", "prev", "fails", "ports"))
+
+        state, cfg = {}, dict(watch.DEFAULTS)
+        for i, pct in enumerate((10, 96)):
+            for name in ("keep", "gone"):
+                watch.Watch(state, cfg, 1_000_000.0 + i * 600).host(name, watch.parse(host_output(disk_pct=pct)))
+        self.assertTrue(holds(state, "gone"))
+        with mock.patch("builtins.print"):
+            for _ in range(2):
+                watch.Watch(state, cfg, 0).forget_removed_hosts(["keep"])
+            self.assertTrue(holds(state, "gone"), "forgotten too early: a half-saved servers.conf would wipe the history")
+            watch.Watch(state, cfg, 0).forget_removed_hosts(["keep", "gone"])      # it came back: the countdown restarts
+            for _ in range(2):
+                watch.Watch(state, cfg, 0).forget_removed_hosts(["keep"])
+            self.assertTrue(holds(state, "gone"))
+            watch.Watch(state, cfg, 0).forget_removed_hosts(["keep"])
+        self.assertFalse(holds(state, "gone"), "state of the removed host is still there: %s" % state)
+        self.assertTrue(holds(state, "keep"))
+
     def test_disk_alert_fires_and_resolves_once(self):
         state, log = run_checks([host_output(disk_pct=10), host_output(disk_pct=90), host_output(disk_pct=90),
                                  host_output(disk_pct=50)])
@@ -224,6 +273,21 @@ class MainLoop(unittest.TestCase):
         self.assertIn("disk", text, "the healthy host's disk alert was lost")
         self.assertIn("cannot evaluate", text, "the broken host was not reported")
 
+    def test_show_one_host_contacts_only_that_host(self):
+        """--show HOST must collect from that host only, not the whole fleet.
+        Defect: every host was contacted and its folders scanned, which took minutes."""
+        (Path(watch.DIR) / "servers.conf").write_text("a | x@a | 22\nb | x@b | 22\nc | x@c | 22\n")
+        contacted = []
+
+        def fake_collect(s, env, du, x=None):
+            contacted.append(s[0])
+            return s[0], watch.parse(host_output())
+
+        with mock.patch.object(watch, "collect", fake_collect), mock.patch.object(sys, "argv", ["watch.py", "--show", "b"]), \
+             mock.patch("builtins.print"):
+            watch.main()
+        self.assertEqual(contacted, ["b"])
+
     def test_empty_server_list_does_not_crash(self):
         """An empty servers.conf should be handled, not crash with ThreadPoolExecutor(max_workers=0)."""
         Path(watch.DIR, "servers.conf").write_text("# nothing\n")
@@ -234,6 +298,13 @@ class MainLoop(unittest.TestCase):
 
 
 class TelegramChunking(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()      # delivery notes of these tests never touch the real state folder
+        p = mock.patch.object(common, "partial_path", lambda: os.path.join(self._tmp.name, "tg_partial.json"))
+        p.start()
+        self.addCleanup(p.stop)
+        self.addCleanup(self._tmp.cleanup)
+
     def test_long_digest_chunks_keep_html_balanced(self):
         """Telegram rejects a message with unbalanced HTML. A digest over 3900 characters is split into chunks;
         each chunk must be valid on its own. Defect: send() splits by line, inside <pre> blocks."""
@@ -260,6 +331,80 @@ class TelegramChunking(unittest.TestCase):
         self.assertTrue(all(len(c) <= 4096 for c in chunks), "a chunk exceeds Telegram's limit")
         strip = lambda t: t.replace("<pre>", "").replace("</pre>", "").replace("\n", "")
         self.assertEqual(strip("".join(chunks)), strip(text), "content was lost or duplicated by chunking")
+
+    class Resp:
+        def read(self):
+            return b"{}"
+
+    def test_failed_later_chunk_is_not_sent_twice_on_retry(self):
+        """A message in several chunks whose second chunk fails is retried later; chunks that already arrived must
+        not be sent again. Defect: the whole message was repeated, so the first chunk appeared twice."""
+        from urllib.parse import parse_qs
+        text = "\n".join("line %04d %s" % (i, "x" * 60) for i in range(150))
+        want = common.chunks(text)
+        self.assertGreater(len(want), 2)
+        tries, ok, env = [0], [], {"TG_CHAT_ID": "1", "TG_BOT_TOKEN": "x"}
+
+        def fake(url, data, timeout):
+            tries[0] += 1
+            if tries[0] == 2:
+                raise OSError("network down")
+            ok.append(parse_qs(data.decode())["text"][0])
+            return self.Resp()
+
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(common, "partial_path", lambda: os.path.join(d, "p.json")), \
+             mock.patch.object(common.urllib.request, "urlopen", fake):
+            with self.assertRaises(OSError):
+                common.tg_send(env, text)
+            self.assertEqual(len(ok), 1)
+            common.tg_send(env, text)                       # the retry
+            self.assertEqual(ok, want, "chunks were repeated or lost")
+            self.assertFalse(os.path.exists(os.path.join(d, "p.json")), "the delivery note was not cleaned up")
+            ok[:] = []
+            common.tg_send(env, text)                       # a later, identical message must be sent in full
+            self.assertEqual(ok, want)
+
+    def fallback_env(self, **extra):
+        env = {"TG_CHAT_ID": "1", "TG_BOT_TOKEN": "MAIN"}
+        env.update(extra)
+        return env
+
+    def run_with_main_bot_blocked(self, env, text="<b>disk</b> 96%"):
+        import urllib.error
+        from urllib.parse import parse_qs
+        seen = []
+
+        def fake(url, data, timeout):
+            seen.append((url, parse_qs(data.decode())))
+            if "/botMAIN/" in url:
+                raise urllib.error.HTTPError(url, 403, "Forbidden: bot was blocked by the user", None, None)
+            return self.Resp()
+
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(common, "partial_path", lambda: os.path.join(d, "p.json")), \
+             mock.patch.object(common.urllib.request, "urlopen", fake), mock.patch("sys.stderr"):
+            try:
+                common.tg_send(env, text)
+            finally:
+                self.seen = seen
+
+    def test_fallback_bot_takes_over_when_the_main_bot_fails(self):
+        """If the main bot is revoked or blocked, a configured fallback bot still delivers, and says so.
+        Defect: there was no second channel, so a broken bot silenced every alert."""
+        self.run_with_main_bot_blocked(self.fallback_env(TG_FALLBACK_BOT_TOKEN="FB", TG_FALLBACK_CHAT_ID="7"))
+        fb = [f for url, f in self.seen if "/botFB/" in url]
+        self.assertEqual(len(fb), 1, "the fallback bot was not used exactly once")
+        self.assertEqual(fb[0]["chat_id"], ["7"])
+        self.assertTrue(fb[0]["text"][0].startswith("⚠️ via the fallback bot"))
+        self.assertIn("<b>disk</b> 96%", fb[0]["text"][0])
+
+    def test_fallback_chat_defaults_to_the_main_chat(self):
+        self.run_with_main_bot_blocked(self.fallback_env(TG_FALLBACK_BOT_TOKEN="FB"))
+        self.assertEqual([f["chat_id"] for url, f in self.seen if "/botFB/" in url], [["1"]])
+
+    def test_without_a_fallback_the_failure_is_still_raised(self):
+        import urllib.error
+        with self.assertRaises(urllib.error.HTTPError):
+            self.run_with_main_bot_blocked(self.fallback_env())
 
     def test_rejected_markup_falls_back_to_plain_text(self):
         """If Telegram rejects the HTML (HTTP 400), the message is resent as plain text instead of being lost."""
@@ -310,6 +455,13 @@ class Prober(unittest.TestCase):
     def test_http_ok_and_server_error(self):
         self.assertTrue(self.p("http://127.0.0.1:%d/ok" % self.port)["ok"])
         self.assertFalse(self.p("http://127.0.0.1:%d/broken" % self.port)["ok"])
+
+    def test_only_ip_without_a_value_is_a_usage_error(self):
+        """probe.py --only-ip with no address must print usage and exit 2, not crash with IndexError."""
+        with mock.patch.object(sys, "argv", ["probe.py", "--only-ip"]), mock.patch("sys.stderr"):
+            with self.assertRaises(SystemExit) as cm:
+                probe.main()
+        self.assertEqual(cm.exception.code, 2)
 
     def test_tcp_open_and_refused(self):
         self.assertTrue(self.p("tcp://127.0.0.1:%d" % self.port)["ok"])
@@ -452,6 +604,30 @@ class HeartbeatReceiver(unittest.TestCase):
         sent = []
         self.rounds(2, sent.append)          # a second round proves the loop is still alive
         self.assertTrue(any("zz-dead" in m and "silent" in m for m in sent), "the healthy entry was not checked")
+
+    def test_fallback_bot_delivers_when_the_main_bot_fails(self):
+        """The dead man's switch must still be able to speak when the main bot is revoked or blocked."""
+        from urllib.parse import parse_qs
+        seen = []
+
+        def fake(url, data, timeout):
+            seen.append((url, parse_qs(data.decode())))
+            if "/botx/" in url:
+                raise OSError("main bot blocked")
+
+            class R:
+                def read(self):
+                    return b"{}"
+            return R()
+
+        with mock.patch.object(self.hb.urllib.request, "urlopen", fake), mock.patch.object(self.hb, "FB_TOKEN", "fbtok"), \
+             mock.patch.object(self.hb, "FB_CHAT", "99"), mock.patch("builtins.print"):
+            self.hb.tg("host-a has gone silent")
+        fb = [f for url, f in seen if "/botfbtok/" in url]
+        self.assertEqual(len(fb), 1)
+        self.assertEqual(fb[0]["chat_id"], ["99"])
+        self.assertIn("host-a has gone silent", fb[0]["text"][0])
+        self.assertIn("fallback", fb[0]["text"][0])
 
     def test_damaged_state_file_is_cleaned_on_load(self):
         with tempfile.TemporaryDirectory() as d:

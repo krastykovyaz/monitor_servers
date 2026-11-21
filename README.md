@@ -56,7 +56,7 @@ weekly on hosts where editor builds pile up.
 ## External checks (`probe.py`)
 
 Checks every target in `probes.conf` over the internet every 5 minutes: HTTP status, TLS certificate validity
-and days to expiry, or a plain TCP connect. Alerts after two consecutive failures, on recovery, and when a
+and days to expiry, or a plain TCP connect. Alerts after three consecutive failures (15 minutes), on recovery, and when a
 certificate has under 14 days left. Targets that resolve to the prober's own address are skipped, so a second
 prober on another server covers them: horek_ge probes everything else, horek_fi probes horek_ge
 (`probe.py --only-ip 2.26.22.251`).
@@ -66,7 +66,7 @@ prober on another server covers them: horek_ge probes everything else, horek_fi 
 A small receiver on horek_ge (systemd unit `monitor-heartbeat` on 127.0.0.1:8787, published by nginx as https://tsech.online:8443; 8443 is one of the few ports the university firewall lets out). Every watcher calls it after each
 run (`HB_URL` in its `.env`). A name that stays silent for 25 minutes raises an alert, and another when it
 returns. This catches what a self-watching host cannot report: its own death, or its whole network going down.
-`/status/<secret>` shows all names; `/forget/<secret>/<name>` retires one.
+`/status/<secret>` shows all names; `/forget/<admin secret>/<name>` retires one (`HB_ADMIN_SECRET`, not the secret every host knows).
 
 ## grak_ai failover (`deploy/grak_ai/failover/`)
 
@@ -115,3 +115,16 @@ cable address changes with DHCP. It therefore dials out to horek_ge over SSH (po
 on horek_ge's loopback port 2201. The tunnel account `pitunnel` has no shell and its key may only listen on that port.
 Connect with `ssh -J root@2.26.22.251 -p 2201 -o HostKeyAlias=pi-tunnel root@127.0.0.1`. The Pi also runs its own Wi-Fi
 (`Dobrolet`, 192.168.50.1), reachable from any device on that Wi-Fi.
+
+## If the Telegram bot fails
+
+Every alert goes through the bot in `TG_BOT_TOKEN`. If it is revoked or blocked, `tg_send` raises, the watcher keeps its
+state unsaved and retries, and the heartbeat receiver notices the missing heartbeat, but all of that still needs a bot
+to speak. Set `TG_FALLBACK_BOT_TOKEN` (and optionally `TG_FALLBACK_CHAT_ID`) in each `.env` and in
+`/etc/monitor-heartbeat.env`: a chunk the main bot cannot deliver is then sent through the second bot, marked
+"via the fallback bot", which also tells you the main one is broken. A message sent in several chunks that fails halfway
+is retried without repeating the chunks that already arrived (`state/tg_partial.json`).
+
+## Removed hosts
+
+A host deleted from `servers.conf` is forgotten (alerts, counters, history) after it has been missing for three runs in a row.

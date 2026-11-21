@@ -1,6 +1,9 @@
 """Helpers shared by watch.py and probe.py. Standard library only, runs on Python 3.5+."""
+import hashlib
+import json
 import os
 import re
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -51,20 +54,83 @@ def chunks(text, limit=TG_LIMIT):
     return out
 
 
+FALLBACK_NOTE = "⚠️ via the fallback bot: the main bot could not deliver this\n"
+PARTIAL_TTL = 3600
+
+
+def _post(token, chat, text):
+    """One sendMessage call. If Telegram rejects the markup (HTTP 400), the text is resent as plain text."""
+    url = "https://api.telegram.org/bot%s/sendMessage" % token
+    fields = {"chat_id": chat, "text": text, "parse_mode": "HTML", "disable_web_page_preview": "1"}
+    try:
+        urllib.request.urlopen(url, urllib.parse.urlencode(fields).encode(), timeout=20).read()
+    except urllib.error.HTTPError as e:
+        if e.code != 400:
+            raise
+        fields.pop("parse_mode")
+        fields["text"] = re.sub(r"</?(b|pre|i|code)>", "", text).replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+        urllib.request.urlopen(url, urllib.parse.urlencode(fields).encode(), timeout=20).read()
+
+
+def _send_chunk(env, text):
+    """Sends through the main bot. If that fails (token revoked, bot blocked, API error) and a fallback bot is
+    configured (TG_FALLBACK_BOT_TOKEN, optional TG_FALLBACK_CHAT_ID), the chunk goes out through it, marked as such."""
+    try:
+        _post(env["TG_BOT_TOKEN"], env["TG_CHAT_ID"], text)
+    except Exception as e:
+        if not env.get("TG_FALLBACK_BOT_TOKEN"):
+            raise
+        print("%s main Telegram bot failed (%s: %s), using the fallback bot" % (
+            time.strftime("%F %T"), type(e).__name__, e), file=sys.stderr)
+        _post(env["TG_FALLBACK_BOT_TOKEN"], env.get("TG_FALLBACK_CHAT_ID") or env["TG_CHAT_ID"], FALLBACK_NOTE + text)
+
+
+def partial_path():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "state", "tg_partial.json")
+
+
+def _partial_load():
+    """Hashes of chunks that an earlier, failed send already delivered (kept for an hour)."""
+    try:
+        with open(partial_path()) as f:
+            d = json.load(f)
+        return list(d["hashes"]) if time.time() - d["t"] < PARTIAL_TTL else []
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
+
+
+def _partial_save(hashes):
+    p = partial_path()
+    try:
+        if hashes:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w") as f:
+                json.dump({"t": time.time(), "hashes": hashes}, f)
+        elif os.path.exists(p):
+            os.remove(p)
+    except OSError:
+        pass
+
+
 def tg_send(env, text):
     """Sends text to Telegram, raising on failure so callers can keep the alert for the next run.
-    If Telegram rejects the markup (HTTP 400), the chunk is resent as plain text rather than lost."""
-    url = "https://api.telegram.org/bot%s/sendMessage" % env["TG_BOT_TOKEN"]
-    for ch in chunks(text):
-        fields = {"chat_id": env["TG_CHAT_ID"], "text": ch, "parse_mode": "HTML", "disable_web_page_preview": "1"}
-        try:
-            urllib.request.urlopen(url, urllib.parse.urlencode(fields).encode(), timeout=20).read()
-        except urllib.error.HTTPError as e:
-            if e.code != 400:
-                raise
-            fields.pop("parse_mode")
-            fields["text"] = re.sub(r"</?(b|pre|i|code)>", "", ch).replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
-            urllib.request.urlopen(url, urllib.parse.urlencode(fields).encode(), timeout=20).read()
+    A long text goes out in several chunks. If a later chunk fails, the chunks already delivered are remembered,
+    and the retry of the same text skips them instead of sending them twice."""
+    done = _partial_load()
+    skipped, delivered = [], []
+    try:
+        for ch in chunks(text):
+            h = hashlib.sha1(ch.encode("utf-8")).hexdigest()[:16]
+            if h in done:
+                done.remove(h)
+                skipped.append(h)
+                continue
+            _send_chunk(env, ch)
+            delivered.append(h)
+    except Exception:
+        _partial_save(done + skipped + delivered)
+        raise
+    _partial_save(done)
 
 
 def hb_ping(env, name, max_silence=None):

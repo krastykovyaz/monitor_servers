@@ -111,7 +111,13 @@ def send(env, text):
 def main():
     args = sys.argv[1:]
     dry, status, digest = "--dry" in args, "--status" in args, "--digest" in args
-    only_ip = args[args.index("--only-ip") + 1] if "--only-ip" in args else None
+    only_ip = None
+    if "--only-ip" in args:
+        i = args.index("--only-ip")
+        if i + 1 >= len(args) or args[i + 1].startswith("--"):
+            print("usage: probe.py --only-ip ADDRESS", file=sys.stderr)
+            sys.exit(2)
+        only_ip = args[i + 1]
     env, now = load_kv(DIR / ".env"), time.time()
     state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
     checks = state.setdefault("checks", {})

@@ -253,7 +253,7 @@ def mb(b):
 class Watch:
     def __init__(self, state, cfg, now, expect=None):
         self.s, self.cfg, self.now, self.expect = state, cfg, now, expect or {}
-        for k in ("active", "pending", "cooldown", "hist", "seen", "prev", "fails", "ports"):
+        for k in ("active", "pending", "cooldown", "hist", "seen", "prev", "fails", "ports", "absent"):
             self.s.setdefault(k, {})
         self.mutes = [m.strip() for m in str(cfg["MUTE"]).split(",") if m.strip()]
         self.fired, self.resolved, self.known = [], [], []
@@ -294,10 +294,38 @@ class Watch:
                         a["text"].split(" — ")[0], (" — now " + ok) if ok else "", dur(self.now - a["since"])))
 
     def drop(self, prefix, keep):
-        """Forget alerts, counters and history of items that no longer exist (removed service, container, ...)."""
+        """Forget alerts, counters and history of items that no longer exist (removed service, container, ...).
+        An item name may itself contain ':' (a pm2 app called api:worker), so a key belongs to an item when it is
+        the name or the name followed by ':suffix'."""
+        def kept(rest):
+            rest = rest[:-3] if rest.endswith("#ok") else rest
+            return any(rest == x or rest.startswith(x + ":") for x in keep)
+
         for bucket in ("active", "pending", "cooldown", "hist"):
-            for key in [k for k in self.s[bucket] if k.startswith(prefix) and k[len(prefix):].split(":")[0].split("#")[0] not in keep]:
+            for key in [k for k in self.s[bucket] if k.startswith(prefix) and not kept(k[len(prefix):])]:
                 self.s[bucket].pop(key, None)
+
+    def forget_removed_hosts(self, watched, after=3):
+        """Forgets everything kept for hosts that are no longer watched (removed from servers.conf), once they have
+        been missing for `after` runs in a row. The wait protects against a servers.conf caught half-saved."""
+        s = self.s
+        known = set(k.split(":", 1)[0] for b in ("active", "pending", "cooldown", "hist") for k in s[b])
+        known |= set(h for b in ("seen", "prev", "fails", "ports") for h in s[b])
+        gone = known - set(watched)
+        for h in list(s["absent"]):
+            if h not in gone:
+                s["absent"].pop(h)
+        for h in sorted(gone):
+            s["absent"][h] = s["absent"].get(h, 0) + 1
+            if s["absent"][h] < after:
+                continue
+            for b in ("active", "pending", "cooldown", "hist"):
+                for k in [k for k in s[b] if k.split(":", 1)[0] == h]:
+                    s[b].pop(k)
+            for b in ("seen", "prev", "fails", "ports"):
+                s[b].pop(h, None)
+            s["absent"].pop(h)
+            print("%s forgot removed host %s" % (time.strftime("%F %T"), h))
 
     def event(self, key, text, baseline=False, cooldown_h=None):
         """Counter-type alert: repeats at most once per cooldown."""
@@ -338,7 +366,7 @@ class Watch:
             pct = cur * 100.0 / host_ram
             self.cond(key + ":max", pct > c["SERVICE_MAX_PCT"],
                       "%s RAM — %s, %d%% of the host's memory" % (label, mb(cur), round(pct)),
-                      confirm=2, baseline=baseline, ok=mb(cur))
+                      confirm=2, baseline=baseline, clear=pct < c["SERVICE_MAX_PCT"] - 5, ok=mb(cur))
 
     def unreachable(self, name):
         if name not in self.s["seen"]:
@@ -663,8 +691,10 @@ def main():
     first_run = not state.get("seen")
     with_du = do_show or (not do_digest and now - state.get("last_du", 0) > 20 * 3600)
     servers, expect = load_servers(include=only), load_expect()
+    if only:      # one host asked for: contact that host only, not the whole fleet
+        servers = [s for s in servers if s[0] == only]
     if not servers:
-        print("%s no servers to watch in servers.conf" % time.strftime("%F %T"))
+        print("%s no servers to watch%s" % (time.strftime("%F %T"), (": %s is not in servers.conf" % only) if only else " in servers.conf"))
         return
     with ThreadPoolExecutor(max_workers=len(servers)) as ex:
         results = list(ex.map(lambda s: collect(s, env, with_du, expect), servers))
@@ -701,6 +731,8 @@ def main():
             w.unreachable(name)
         else:
             never.append(name)
+    if not only:
+        w.forget_removed_hosts([s[0] for s in servers])
     if with_du and any(d and d["du"] for n, d in results):
         state["last_du"] = now
 

@@ -17,6 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 SECRET = os.environ["HB_SECRET"]
 TOKEN, CHAT = os.environ["TG_BOT_TOKEN"], os.environ["TG_CHAT_ID"]
+FB_TOKEN, FB_CHAT = os.environ.get("TG_FALLBACK_BOT_TOKEN", ""), os.environ.get("TG_FALLBACK_CHAT_ID", "")
 ADMIN = os.environ.get("HB_ADMIN_SECRET", "")
 BIND = os.environ.get("HB_BIND", "0.0.0.0")
 PORT = int(os.environ.get("HB_PORT", "8787"))
@@ -25,10 +26,26 @@ STATE = os.path.join(os.environ.get("STATE_DIRECTORY", "/var/lib/monitor-heartbe
 NAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,48}")
 
 lock = threading.Lock()
-try:
-    beats = json.load(open(STATE))
-except Exception:
-    beats = {}
+
+
+def load_beats():
+    """Reads the saved state. An entry without a usable 'last' time is dropped, so a damaged file cannot stop the checker."""
+    try:
+        raw = json.load(open(STATE))
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    good = {}
+    for n, b in raw.items():
+        if isinstance(b, dict) and isinstance(b.get("last"), (int, float)):
+            good[n] = b
+        else:
+            print("dropping malformed heartbeat entry %r" % (n,), flush=True)
+    return good
+
+
+beats = load_beats()
 pending_new, pending_back, dirty = [], [], [False]
 
 
@@ -39,12 +56,21 @@ def save():
     os.replace(tmp, STATE)
 
 
+def _post(token, chat, text):
+    data = urllib.parse.urlencode({"chat_id": chat, "text": text, "parse_mode": "HTML"}).encode()
+    urllib.request.urlopen("https://api.telegram.org/bot%s/sendMessage" % token, data, timeout=20).read()
+
+
 def tg(text):
+    """Sends text to Telegram. Raises on failure, so the caller can keep the alert for the next round.
+    If the main bot fails and a fallback bot is configured, the message goes out through the fallback."""
     try:
-        data = urllib.parse.urlencode({"chat_id": CHAT, "text": text, "parse_mode": "HTML"}).encode()
-        urllib.request.urlopen("https://api.telegram.org/bot%s/sendMessage" % TOKEN, data, timeout=20).read()
+        _post(TOKEN, CHAT, text)
     except Exception as e:
-        print("telegram send failed: %s" % e, flush=True)
+        if not FB_TOKEN:
+            raise
+        print("main Telegram bot failed (%s: %s), using the fallback bot" % (type(e).__name__, e), flush=True)
+        _post(FB_TOKEN, FB_CHAT or CHAT, "⚠️ via the fallback bot: the main bot could not deliver this\n" + text)
 
 
 def dur(sec):
@@ -104,31 +130,57 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+def check_once():
+    """One round: work out what to announce, send it, and undo the bookkeeping if the send fails,
+    so that an alert is never marked as delivered when nobody was told."""
+    now, lines = time.time(), []
+    with lock:
+        new_now, back_now, silent_now = sorted(pending_new), list(pending_back), []
+        del pending_new[:]
+        del pending_back[:]
+        if new_now:
+            lines.append("💓 <b>Heartbeat registered</b>: " + ", ".join(html.escape(n) for n in new_now))
+        for name, gap in back_now:
+            lines.append("✅ <b>%s</b> is reporting again (silent for %s)" % (html.escape(name), dur(gap)))
+        for name, b in sorted(beats.items()):
+            try:
+                if not b.get("silent") and now - b["last"] > b.get("max", SILENT_AFTER):
+                    b["silent"] = True
+                    silent_now.append(name)
+                    lines.append("🔇 <b>%s</b> has gone silent — last heartbeat %s ago. The host, its network or its monitoring is down."
+                                 % (html.escape(name), dur(now - b["last"])))
+            except Exception as e:      # a damaged entry must not stop the others from being checked
+                print("skipping heartbeat entry %r: %s: %s" % (name, type(e).__name__, e), flush=True)
+    if lines:
+        try:
+            tg("\n".join(lines))
+        except Exception as e:
+            print("telegram send failed, will retry next round: %s" % e, flush=True)
+            with lock:
+                pending_new.extend(new_now)
+                pending_back.extend(back_now)
+                for name in silent_now:
+                    if name in beats:
+                        beats[name]["silent"] = False
+        else:
+            if silent_now:
+                dirty[0] = True
+    with lock:
+        if dirty[0]:
+            try:
+                save()
+                dirty[0] = False
+            except Exception as e:
+                print("state save failed: %s" % e, flush=True)
+
+
 def checker():
     while True:
         time.sleep(60)
-        now, lines = time.time(), []
-        with lock:
-            if pending_new:
-                lines.append("💓 <b>Heartbeat registered</b>: " + ", ".join(html.escape(n) for n in sorted(pending_new)))
-                del pending_new[:]
-            for name, gap in pending_back:
-                lines.append("✅ <b>%s</b> is reporting again (silent for %s)" % (html.escape(name), dur(gap)))
-            del pending_back[:]
-            for name, b in sorted(beats.items()):
-                if not b.get("silent") and now - b["last"] > b.get("max", SILENT_AFTER):
-                    b["silent"] = True
-                    dirty[0] = True
-                    lines.append("🔇 <b>%s</b> has gone silent — last heartbeat %s ago. The host, its network or its monitoring is down."
-                                 % (html.escape(name), dur(now - b["last"])))
-            if dirty[0]:
-                try:
-                    save()
-                    dirty[0] = False
-                except Exception as e:
-                    print("state save failed: %s" % e, flush=True)
-        if lines:
-            tg("\n".join(lines))
+        try:
+            check_once()
+        except Exception as e:          # this thread must never die: a silent checker is a dead watchdog
+            print("checker round failed: %s: %s" % (type(e).__name__, e), flush=True)
 
 
 if __name__ == "__main__":
