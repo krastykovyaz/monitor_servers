@@ -9,7 +9,8 @@ import urllib.request
 TG_LIMIT = 3900
 
 
-def load_kv(path):
+def load_kv(path, inline_comments=False):
+    """Reads KEY=VALUE lines. With inline_comments, ' # note' after a value is dropped (watch.conf style)."""
     d = {}
     if path.exists():
         for line in path.read_text().splitlines():
@@ -17,6 +18,8 @@ def load_kv(path):
             if not line or line.startswith("#") or "=" not in line:
                 continue
             k, v = line.split("=", 1)
+            if inline_comments:
+                v = re.split(r"\s+#", v, maxsplit=1)[0]
             d[k.strip()] = v.strip().strip('"').strip("'")
     return d
 

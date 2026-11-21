@@ -119,14 +119,19 @@ echo "END"
 
 
 def load_cfg():
+    """DEFAULTS overridden by watch.conf. A line that cannot be read is skipped with a note in the log:
+    a typo in the config must not take the whole watcher down."""
     cfg = dict(DEFAULTS)
-    for k, v in load_kv(DIR / "watch.conf").items():
-        if k in cfg:
-            cfg[k] = v if k == "MUTE" else float(v)
-        elif "@" in k and k.split("@", 1)[0] in cfg and k.split("@", 1)[0] != "MUTE":
-            # per-server override, e.g. LOAD_FACTOR@horek_ge2=4
-            key, host = k.split("@", 1)
-            cfg.setdefault("_host", {}).setdefault(host, {})[key] = float(v)
+    for k, v in load_kv(DIR / "watch.conf", inline_comments=True).items():
+        key, _, host = k.partition("@")
+        try:
+            if k in cfg:
+                cfg[k] = v if k == "MUTE" else float(v)
+            elif host and key in cfg and key != "MUTE":
+                # per-server override, e.g. LOAD_FACTOR@horek_ge2=4
+                cfg.setdefault("_host", {}).setdefault(host, {})[key] = float(v)
+        except ValueError:
+            print("%s watch.conf: ignoring %s=%r (not a number)" % (time.strftime("%F %T"), k, v), file=sys.stderr)
     return cfg
 
 
@@ -162,6 +167,13 @@ def load_servers(include=None):
 def num(v):
     try:
         return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def fnum(v):
+    try:
+        return float(v)
     except (TypeError, ValueError):
         return None
 
@@ -350,13 +362,14 @@ class Watch:
             a = s["active"].pop(key)
             self.resolved.append("%s reachable again (was down for %s)" % (B, dur(self.now - a["since"])))
 
-        h = {k: (float(v) if k == "load1" else num(v)) for k, v in d["host"].items()}
+        # a reading that is empty or unreadable becomes None, and its check is skipped
+        h = {k: (fnum(v) if k == "load1" else num(v)) for k, v in d["host"].items()}
         ram = (h.get("mem_total_kb") or 0) * 1024
         # reboot
         if prev.get("uptime_s") is not None and h.get("uptime_s") is not None and h["uptime_s"] < prev["uptime_s"]:
             self.event("%s:reboot" % name, "%s rebooted — up %s" % (B, dur(h["uptime_s"])), cooldown_h=0)
         # disk
-        if h.get("disk_total_kb"):
+        if h.get("disk_total_kb") and h.get("disk_used_kb") is not None:
             pct = h["disk_used_kb"] * 100.0 / h["disk_total_kb"]
             free_gb = (h["disk_total_kb"] - h["disk_used_kb"]) / 1048576.0
             txt = "%s disk — %d%% used, %.1f GB free" % (B, round(pct), free_gb)
@@ -369,12 +382,12 @@ class Watch:
                 self.event("%s:disk:grow" % name, "%s disk grew %.1f GB in the last day — now %d%% used" % (
                     B, (h["disk_used_kb"] - old) / 1048576.0, round(pct)), baseline=baseline, cooldown_h=12)
         # memory, swap, load
-        if h.get("mem_total_kb"):
+        if h.get("mem_total_kb") and h.get("mem_avail_kb") is not None:
             ap = h["mem_avail_kb"] * 100.0 / h["mem_total_kb"]
             self.cond("%s:mem" % name, ap < c["MEM_AVAIL_MIN_PCT"],
                       "%s memory — only %s available (%d%%)" % (B, mb(h["mem_avail_kb"] * 1024), round(ap)),
                       confirm=2, baseline=baseline, clear=ap > c["MEM_AVAIL_MIN_PCT"] + 4, ok=mb(h["mem_avail_kb"] * 1024) + " available")
-        if h.get("swap_total_kb"):
+        if h.get("swap_total_kb") and h.get("swap_free_kb") is not None:
             sp = (h["swap_total_kb"] - h["swap_free_kb"]) * 100.0 / h["swap_total_kb"]
             self.cond("%s:swap" % name, sp >= c["SWAP_USED_PCT"], "%s swap — %d%% used" % (B, round(sp)),
                       confirm=2, baseline=baseline, clear=sp < c["SWAP_USED_PCT"] - 15, ok="%d%% used" % round(sp))
@@ -675,7 +688,15 @@ def main():
     never = []
     for name, d in results:
         if d:
-            w.host(name, d)
+            try:
+                w.host(name, d)
+            except Exception as e:
+                # unexpected data from one host must not stop the evaluation of the others
+                print("%s %s: evaluation failed: %s: %s" % (time.strftime("%F %T"), name, type(e).__name__, e), file=sys.stderr)
+                w.cond("%s:watch-error" % name, True, "<b>%s</b> — the watcher cannot evaluate this host (%s: %s)" % (
+                    html.escape(name), type(e).__name__, html.escape(str(e)[:80])), confirm=2)
+            else:
+                w.cond("%s:watch-error" % name, False, "", ok="evaluating normally again")
         elif name in state.get("seen", {}):
             w.unreachable(name)
         else:

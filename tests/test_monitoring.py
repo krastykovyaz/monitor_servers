@@ -83,7 +83,40 @@ class ParsingAndConfig(unittest.TestCase):
         self.assertEqual(exp["h"]["dir"], ["/ok/path"])
 
 
+    def test_inline_comments_in_watch_conf_are_ignored(self):
+        """Uncommenting a sample line exactly as written in watch.conf (value, spaces, '# note') must work.
+        Defect: the whole line was parsed as the number and the watcher crashed with ValueError."""
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "watch.conf").write_text("SERVICE_GROW_FACTOR=2.5    # RAM above this x the median\n"
+                                             "MUTE=h:swap,h:disk:*   # silenced on purpose\n"
+                                             "LOAD_FACTOR@h=3  # per server\n")
+            with mock.patch.object(watch, "DIR", Path(d)):
+                cfg = watch.load_cfg()
+        self.assertEqual(cfg["SERVICE_GROW_FACTOR"], 2.5)
+        self.assertEqual(cfg["MUTE"], "h:swap,h:disk:*")
+        self.assertEqual(cfg["_host"]["h"]["LOAD_FACTOR"], 3.0)
+
+    def test_unreadable_line_in_watch_conf_is_skipped_not_fatal(self):
+        """A typo in one threshold must not stop the watcher; the other lines still apply."""
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "watch.conf").write_text("DISK_WARN_PCT=abc\nLOAD_FACTOR=3\nLOAD_FACTOR@h=xyz\n")
+            with mock.patch.object(watch, "DIR", Path(d)), mock.patch("sys.stderr"):
+                cfg = watch.load_cfg()
+        self.assertEqual(cfg["DISK_WARN_PCT"], watch.DEFAULTS["DISK_WARN_PCT"])
+        self.assertEqual(cfg["LOAD_FACTOR"], 3.0)
+        self.assertNotIn("_host", cfg)
+
+
 class AlertLogic(unittest.TestCase):
+    def test_empty_readings_do_not_crash_the_evaluation(self):
+        """A host that returns an empty value (a failed awk or cut on the remote side) is evaluated without
+        that reading. Defect: float('') or None * 100 raised and aborted the run for every host."""
+        good = host_output()
+        for old, new in (("mem_avail_kb=3000000", "mem_avail_kb="), ("load1=0.5", "load1="),
+                         ("disk_used_kb=100000", "disk_used_kb="), ("swap_free_kb=0", "swap_free_kb=")):
+            self.assertIn(old, good)
+            run_checks([good.replace(old, new)] * 2)
+
     def test_disk_alert_fires_and_resolves_once(self):
         state, log = run_checks([host_output(disk_pct=10), host_output(disk_pct=90), host_output(disk_pct=90),
                                  host_output(disk_pct=50)])
@@ -164,6 +197,32 @@ class MainLoop(unittest.TestCase):
         self.run_main(host_output(disk_pct=10))
         _, beats = self.run_main(host_output(disk_pct=96), send_fails=True)
         self.assertEqual(beats, [], "heartbeat was sent although the alert failed")
+
+    def test_one_broken_host_does_not_stop_the_others(self):
+        """If evaluating one host raises, the other hosts are still evaluated and alerted, and the broken
+        host is reported. Defect: the exception ended the run, so nobody got any alert."""
+        (Path(watch.DIR) / "servers.conf").write_text("bad | local | -\ngood | local | -\n")
+        sent, real_host = [], watch.Watch.host
+
+        def host(self, name, d):
+            if name == "bad":
+                raise RuntimeError("unexpected value")
+            return real_host(self, name, d)
+
+        def run(good_output):
+            outs = {"bad": host_output(), "good": good_output}
+            with mock.patch.object(watch, "collect", lambda s, e, du, x=None: (s[0], watch.parse(outs[s[0]]))), \
+                 mock.patch.object(watch.Watch, "host", host), \
+                 mock.patch.object(watch, "send", lambda env, text: sent.append(text)), \
+                 mock.patch.object(watch, "heartbeat", lambda env, servers: None), \
+                 mock.patch.object(sys, "argv", ["watch.py"]), mock.patch("builtins.print"), mock.patch("sys.stderr"):
+                watch.main()
+
+        run(host_output(disk_pct=10))
+        run(host_output(disk_pct=96))
+        text = "\n".join(sent)
+        self.assertIn("disk", text, "the healthy host's disk alert was lost")
+        self.assertIn("cannot evaluate", text, "the broken host was not reported")
 
     def test_empty_server_list_does_not_crash(self):
         """An empty servers.conf should be handled, not crash with ThreadPoolExecutor(max_workers=0)."""
@@ -348,6 +407,60 @@ class HeartbeatReceiver(unittest.TestCase):
                 pass
         self.assertTrue(any("old-host" in m and "silent" in m for m in sent))
         self.assertTrue(self.hb.beats["old-host"]["silent"])
+
+    def rounds(self, n, tg):
+        """Runs n checker rounds with the given Telegram sender."""
+        calls = {"n": 0}
+
+        def sleep(_):
+            calls["n"] += 1
+            if calls["n"] > n:
+                raise StopIteration
+
+        with mock.patch.object(self.hb, "tg", tg), mock.patch.object(self.hb.time, "sleep", sleep), \
+             mock.patch("builtins.print"):
+            try:
+                self.hb.checker()
+            except StopIteration:
+                pass
+
+    def test_silence_alert_survives_a_failed_telegram_send(self):
+        """If Telegram cannot be reached when a host goes silent, the alert is sent in a later round.
+        Defect: the host was marked silent before sending, so the alert was lost for good."""
+        self.addCleanup(self.hb.beats.pop, "lost-host", None)
+        with self.hb.lock:
+            self.hb.beats["lost-host"] = {"first": 0, "last": time.time() - 7200, "silent": False}
+
+        def down(text):
+            raise OSError("telegram unreachable")
+
+        self.rounds(1, down)
+        self.assertFalse(self.hb.beats["lost-host"]["silent"], "marked silent although nobody was told")
+        sent = []
+        self.rounds(1, sent.append)
+        self.assertTrue(any("lost-host" in m and "silent" in m for m in sent), "the alert never arrived")
+        self.assertTrue(self.hb.beats["lost-host"]["silent"])
+
+    def test_a_damaged_entry_does_not_stop_the_checker(self):
+        """One entry without a 'last' time must not end the checker thread, which would stop every later
+        silence alert while the receiver keeps answering. Defect: KeyError escaped the loop."""
+        self.addCleanup(self.hb.beats.pop, "broken", None)
+        self.addCleanup(self.hb.beats.pop, "zz-dead", None)
+        with self.hb.lock:
+            self.hb.beats["broken"] = {"first": 0}
+            self.hb.beats["zz-dead"] = {"first": 0, "last": time.time() - 7200, "silent": False}
+        sent = []
+        self.rounds(2, sent.append)          # a second round proves the loop is still alive
+        self.assertTrue(any("zz-dead" in m and "silent" in m for m in sent), "the healthy entry was not checked")
+
+    def test_damaged_state_file_is_cleaned_on_load(self):
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "beats.json").write_text(json.dumps({
+                "good": {"first": 1, "last": 2, "silent": False}, "no-last": {"first": 1}, "text": "oops", "none": None}))
+            with mock.patch.dict(os.environ, {"HB_SECRET": "s", "TG_BOT_TOKEN": "x", "TG_CHAT_ID": "1", "STATE_DIRECTORY": d}), \
+                 mock.patch("builtins.print"):
+                hb2 = load("heartbeat_server_reload", "heartbeat_server.py")
+        self.assertEqual(sorted(hb2.beats), ["good"])
 
     def test_idle_connections_are_dropped(self):
         """A client that connects and sends nothing must be disconnected, or idle connections pile up
